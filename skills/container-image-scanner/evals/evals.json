@@ -1,0 +1,47 @@
+{
+  "skill_name": "container-image-scanner",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I need to scan the nginx:latest Docker image for security vulnerabilities and generate a CIS benchmark compliance report. Save the report to /tmp/nginx-scan/. I'm preparing for a security audit next week and need to know the risk level and which CIS Docker Benchmark controls are failing.",
+      "expected_output": "A security scan of nginx:latest is performed using Trivy. An HTML and/or Markdown report is saved to /tmp/nginx-scan/. The report includes: overall risk rating, CIS compliance score, vulnerability counts by severity (CRITICAL/HIGH/MEDIUM/LOW), CIS-DI control check results (especially CIS-DI-0001 for non-root user), and remediation recommendations.",
+      "files": [],
+      "assertions": [
+        "The output directory /tmp/nginx-scan/ contains a security-report.html or security-report.md file",
+        "The report includes an overall risk rating (CRITICAL, HIGH, MEDIUM, LOW, or PASS)",
+        "The report contains a CIS Docker Benchmark compliance section with control check results",
+        "The report shows vulnerability counts broken down by severity (CRITICAL, HIGH, MEDIUM, LOW)",
+        "The report includes remediation recommendations",
+        "The agent mentions CIS-DI-0001 (non-root user) check result since nginx:latest runs as root"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Can you check if the python:3.9-slim image has any critical or high vulnerabilities? I just want a quick security check — save results to /tmp/python-scan and tell me the most important things I need to fix.",
+      "expected_output": "Trivy scans python:3.9-slim for vulnerabilities. The agent reports the number of CRITICAL and HIGH vulnerabilities found, identifies the top findings with CVE IDs and affected packages, states whether fix versions are available, and provides a prioritized list of things to fix. A report is saved to /tmp/python-scan/.",
+      "files": [],
+      "assertions": [
+        "The scan completes and reports vulnerability counts for python:3.9-slim",
+        "The agent specifically calls out CRITICAL and HIGH severity findings if any exist",
+        "The agent provides CVE IDs for the most important vulnerabilities found",
+        "The agent mentions whether fixes are available for critical/high CVEs",
+        "The report is saved to /tmp/python-scan/",
+        "The agent provides at least one actionable recommendation"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run a full security scan including secret detection on the alpine:3.18 image. Output directory: /tmp/alpine-scan. Generate both HTML and Markdown reports. I need the CIS benchmark compliance percentage and a full list of any exposed secrets.",
+      "expected_output": "A full scan of alpine:3.18 is performed with vulnerability, misconfiguration, and secret scanning enabled. Both HTML and Markdown reports are generated in /tmp/alpine-scan/. The response includes the CIS compliance percentage, and explicitly states whether any secrets were found. Since alpine:3.18 is a minimal image, the vulnerability count should be low.",
+      "files": [],
+      "assertions": [
+        "Both security-report.html and security-report.md are generated in /tmp/alpine-scan/",
+        "The report includes secret scanning results (either '0 secrets found' or lists found secrets)",
+        "The CIS benchmark compliance percentage is stated (e.g., 'X/Y checks passed (Z%)')",
+        "The agent used --scan-secrets flag when running scan_image.py",
+        "The report has an executive summary section",
+        "The agent acknowledges alpine:3.18 is a minimal image with a relatively small attack surface"
+      ]
+    }
+  ]
+}

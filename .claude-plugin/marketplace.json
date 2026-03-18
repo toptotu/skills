@@ -40,6 +40,15 @@
         "./skills/web-artifacts-builder",
         "./skills/webapp-testing"
       ]
+    },
+    {
+      "name": "security-skills",
+      "description": "Container image security scanning skill for generating CIS benchmark-based security audit reports",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/container-image-scanner"
+      ]
     }
     ,
     {

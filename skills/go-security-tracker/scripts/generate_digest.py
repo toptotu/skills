@@ -30,10 +30,12 @@ try:
         get_discovered_patterns,
         PATTERN_VULN_FEATURES,
         PATTERN_DEFENSE_POINTS,
+        PATTERN_CODE_EXAMPLES,
         _pattern_display_name,
     )
     _ANALYZER_AVAILABLE = True
 except ImportError:
+    PATTERN_CODE_EXAMPLES = {}
     _ANALYZER_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -82,6 +84,69 @@ def _cat_label(cat: str) -> str:
 
 def _is_new_pattern(cat: str) -> bool:
     return cat.startswith("G-NEW-")
+
+
+def _aggregate_characteristics(vulns: list[dict], cat: str) -> dict:
+    """
+    从一组 advisory 中聚合最高质量的特征数据。
+    优先级：真实 diff > 模式库模板 > 描述提取 > 自动生成
+    保证 vuln_features、before_code、after_code、defense_points 均非空。
+    """
+    all_features: list[str]  = []
+    all_defense:  list[str]  = []
+    all_triggers: list[str]  = []
+    best_before = best_after = best_filename = ""
+    best_source = "auto"
+    source_rank = {"diff": 0, "template": 1, "description": 2, "auto": 3}
+
+    for v in vulns:
+        char = v.get("characteristics", {})
+        if not char:
+            continue
+
+        # 聚合特征（去重）
+        for f in char.get("vuln_features", []):
+            if f and f not in all_features:
+                all_features.append(f)
+        for d in char.get("defense_points", []):
+            if d and d not in all_defense:
+                all_defense.append(d)
+        for t in char.get("trigger_conditions", []):
+            if t and t not in all_triggers:
+                all_triggers.append(t)
+
+        # 选最高质量的代码示例
+        src = char.get("characteristics_source", "auto")
+        if source_rank.get(src, 3) < source_rank.get(best_source, 3):
+            if char.get("before_code") or char.get("after_code"):
+                best_before   = char.get("before_code", "")
+                best_after    = char.get("after_code", "")
+                best_filename = char.get("diff_filename", "")
+                best_source   = src
+
+    # 最终保底：模式库模板
+    if not best_before and cat in PATTERN_CODE_EXAMPLES:
+        best_before, best_after = PATTERN_CODE_EXAMPLES[cat]
+        best_source = "template"
+
+    if not all_features:
+        all_features = PATTERN_VULN_FEATURES.get(cat, ["见漏洞描述"])
+    if not all_defense:
+        all_defense = PATTERN_DEFENSE_POINTS.get(cat, ["升级到官方修复版本"])
+    if not best_before:
+        best_before = "// 本期无可用代码对比，请参考 references/go_vuln_patterns.md"
+        best_after  = "// 请参考官方 advisory 中的修复版本信息"
+        best_source = "none"
+
+    return {
+        "vuln_features":  all_features[:5],
+        "defense_points": all_defense[:5],
+        "trigger_conditions": list(dict.fromkeys(all_triggers))[:3],
+        "before_code":    best_before,
+        "after_code":     best_after,
+        "diff_filename":  best_filename,
+        "source":         best_source,
+    }
 
 def _get_pkg(v: dict) -> str:
     for a in v.get("affected", []):
@@ -252,96 +317,75 @@ def generate_markdown(data: dict, date_str: str) -> str:
                 "",
             ]
 
+        # 聚合本组最高质量特征数据（保证每个模式都有完整内容）
+        agg = _aggregate_characteristics(vulns, cat)
+
         lines += [
             f"**本期漏洞数**: {len(vulns)} 条（CRITICAL/HIGH: {high_count} 条）",
             "",
         ]
 
-        # ── 漏洞特征 ──
+        # ── 漏洞特征 ──────────────────────────────────────────
         lines += ["#### 漏洞特征", ""]
-
-        # 聚合本组漏洞的 characteristics
-        all_features = []
-        for v in vulns:
-            char = v.get("characteristics", {})
-            for feat in char.get("vuln_features", []):
-                if feat not in all_features:
-                    all_features.append(feat)
-
-        if all_features:
-            for feat in all_features[:5]:
-                lines.append(f"- {feat}")
-        else:
-            for feat in PATTERN_VULN_FEATURES.get(cat, ["参见漏洞描述"])[:4]:
-                lines.append(f"- {feat}")
+        for feat in agg["vuln_features"][:5]:
+            lines.append(f"- {feat}")
         lines.append("")
 
-        # ── 触发条件 ──
-        trigger_set = set()
-        for v in vulns:
-            for t in v.get("characteristics", {}).get("trigger_conditions", []):
-                trigger_set.add(t)
-        if trigger_set:
+        # ── 触发条件 ──────────────────────────────────────────
+        if agg["trigger_conditions"]:
             lines += ["**触发条件**:", ""]
-            for t in list(trigger_set)[:3]:
+            for t in agg["trigger_conditions"]:
                 lines.append(f"- {t}")
             lines.append("")
 
-        # ── 代码修改前后对比 ──
-        # 找到有 diff 的漏洞
-        vuln_with_diff = [
-            v for v in vulns
-            if v.get("characteristics", {}).get("before_code")
-               or v.get("characteristics", {}).get("after_code")
+        # ── 代码修改前后对比 ──────────────────────────────────
+        src_label = {
+            "diff":        "（来源：真实修复提交 diff）",
+            "template":    "（来源：CIS/漏洞模式库典型案例）",
+            "description": "（来源：根据漏洞描述自动生成）",
+            "none":        "（暂无可用代码对比）",
+        }.get(agg["source"], "")
+
+        example_vid = ""
+        for v in vulns:
+            char = v.get("characteristics", {})
+            if char.get("characteristics_source") == "diff" and char.get("before_code"):
+                example_vid = v.get("id") or v.get("cve_id") or ""
+                break
+        if not example_vid:
+            v0 = vulns[0] if vulns else {}
+            example_vid = v0.get("id") or v0.get("cve_id") or v0.get("ghsa_id") or ""
+
+        ref_parts = []
+        if example_vid:
+            ref_parts.append(f"`{example_vid}`")
+        if agg["diff_filename"]:
+            ref_parts.append(f"`{agg['diff_filename']}`")
+        if src_label:
+            ref_parts.append(src_label)
+        ref_line = "> 参考: " + " — ".join(ref_parts) if ref_parts else ""
+
+        lines += [f"#### 代码修改对比{src_label}", ""]
+        if ref_line:
+            lines += [ref_line, ""]
+
+        lines += [
+            "**修改前（存在漏洞）**:",
+            "```go",
+            agg["before_code"],
+            "```",
+            "",
+            "**修改后（已修复）**:",
+            "```go",
+            agg["after_code"],
+            "```",
+            "",
         ]
 
-        if vuln_with_diff:
-            lines += ["#### 代码修改对比（典型案例）", ""]
-            # 选最严重的那条
-            example = vuln_with_diff[0]
-            char = example.get("characteristics", {})
-            vid  = example.get("id") or example.get("cve_id") or ""
-            fname = char.get("diff_filename", "")
-            lines += [
-                f"> 来源: `{vid}`"
-                + (f" — `{fname}`" if fname else ""),
-                "",
-            ]
-            if char.get("before_code"):
-                lines += [
-                    "**修改前（存在漏洞）**:",
-                    "```go",
-                    char["before_code"],
-                    "```",
-                    "",
-                ]
-            if char.get("after_code"):
-                lines += [
-                    "**修改后（已修复）**:",
-                    "```go",
-                    char["after_code"],
-                    "```",
-                    "",
-                ]
-        else:
-            # 无 diff 时从模式库提供示例
-            lines += _pattern_code_example_md(cat)
-
-        # ── 防御方案 ──
+        # ── 防御方案 ──────────────────────────────────────────
         lines += ["#### 防御方案", ""]
-
-        all_defense = []
-        for v in vulns:
-            for d in v.get("characteristics", {}).get("defense_points", []):
-                if d not in all_defense:
-                    all_defense.append(d)
-
-        if all_defense:
-            for d in all_defense[:5]:
-                lines.append(f"- {d}")
-        else:
-            for d in PATTERN_DEFENSE_POINTS.get(cat, ["参见 references/go_vuln_patterns.md"])[:4]:
-                lines.append(f"- {d}")
+        for d in agg["defense_points"][:5]:
+            lines.append(f"- {d}")
         lines.append("")
 
         # ── 本期相关漏洞 ──
@@ -605,80 +649,47 @@ def generate_html(data: dict, date_str: str) -> str:
         is_new  = _is_new_pattern(cat)
         dp      = discovered.get(cat) if is_new else None
 
-        # 聚合特征
-        all_features: list[str] = []
-        all_triggers: list[str] = []
-        all_defense:  list[str] = []
+        # 聚合最高质量特征数据（保证完整性）
+        agg = _aggregate_characteristics(vulns, cat)
+
+        feature_items = "".join(f"<li>{_h(f)}</li>" for f in agg["vuln_features"][:5])
+        trigger_items = "".join(f"<li>{_h(t)}</li>" for t in agg["trigger_conditions"][:3])
+        defense_items = "".join(f"<li>{_h(d)}</li>" for d in agg["defense_points"][:5])
+
+        # 代码对比（始终有内容）
+        src_titles = {
+            "diff":        "代码修改对比（来源：真实修复提交 diff）",
+            "template":    "代码修改对比（来源：CIS/漏洞模式库典型案例）",
+            "description": "代码修改对比（来源：根据漏洞描述自动生成）",
+            "none":        "代码修改对比（暂无，参见官方 advisory）",
+        }
+        diff_title = src_titles.get(agg["source"], "代码修改对比")
+
+        # 来源引用标注
+        ref_vid = ""
         for v in vulns:
             char = v.get("characteristics", {})
-            for f in char.get("vuln_features", []):
-                if f not in all_features: all_features.append(f)
-            for t in char.get("trigger_conditions", []):
-                if t not in all_triggers: all_triggers.append(t)
-            for d in char.get("defense_points", []):
-                if d not in all_defense: all_defense.append(d)
+            if char.get("characteristics_source") == "diff" and char.get("before_code"):
+                ref_vid = _h(v.get("id") or v.get("cve_id") or "")
+                break
+        if not ref_vid:
+            v0 = vulns[0] if vulns else {}
+            ref_vid = _h(v0.get("id") or v0.get("cve_id") or v0.get("ghsa_id") or "")
 
-        if not all_features:
-            all_features = PATTERN_VULN_FEATURES.get(cat, [])
-        if not all_defense:
-            all_defense = PATTERN_DEFENSE_POINTS.get(cat, [])
+        fname_label = f" — <code>{_h(agg['diff_filename'])}</code>" if agg["diff_filename"] else ""
+        ref_label = f'<span class="diff-ref">参考: <code>{ref_vid}</code>{fname_label}</span>' if ref_vid else ""
 
-        feature_items = "".join(f"<li>{_h(f)}</li>" for f in all_features[:5])
-        trigger_items = "".join(f"<li>{_h(t)}</li>" for t in all_triggers[:3])
-        defense_items = "".join(f"<li>{_h(d)}</li>" for d in all_defense[:5])
-
-        # 代码 diff（找第一个有 diff 的漏洞）
-        diff_section = ""
-        vuln_with_diff = [v for v in vulns
-                          if v.get("characteristics", {}).get("before_code")
-                          or v.get("characteristics", {}).get("after_code")]
-        if vuln_with_diff:
-            ex = vuln_with_diff[0]
-            char = ex.get("characteristics", {})
-            vid_ex = _h(ex.get("id") or ex.get("cve_id") or "")
-            fname  = _h(char.get("diff_filename",""))
-            before = _h(char.get("before_code",""))
-            after  = _h(char.get("after_code",""))
-            diff_section = f"""
+        diff_section = f"""
             <div class="diff-block">
-              <div class="diff-title">代码修改对比 — <code>{vid_ex}</code> {('— '+fname) if fname else ''}</div>
+              <div class="diff-title">{_h(diff_title)} {ref_label}</div>
               <div class="diff-grid">
                 <div class="diff-col">
                   <div class="diff-col-header before-header">⚠ 修改前（存在漏洞）</div>
-                  <pre class="diff-code before-code">{before}</pre>
+                  <pre class="diff-code before-code">{_h(agg['before_code'])}</pre>
                 </div>
                 <div class="diff-col">
                   <div class="diff-col-header after-header">✓ 修改后（已修复）</div>
-                  <pre class="diff-code after-code">{after}</pre>
-                </div>
-              </div>
-            </div>"""
-        else:
-            # 无实际 diff，使用模式库示例
-            eg_lines = _pattern_code_example_md(cat)
-            if eg_lines:
-                before_lines: list[str] = []
-                after_lines:  list[str] = []
-                in_before = False; in_after = False
-                for ln in eg_lines:
-                    if "修改前" in ln: in_before = True; in_after = False; continue
-                    if "修改后" in ln: in_after = True; in_before = False; continue
-                    if ln.startswith("```"): continue
-                    if in_before: before_lines.append(ln)
-                    elif in_after: after_lines.append(ln)
-                before_code = _h("\n".join(before_lines))
-                after_code  = _h("\n".join(after_lines))
-                diff_section = f"""
-            <div class="diff-block">
-              <div class="diff-title">典型代码模式示例（来自模式库）</div>
-              <div class="diff-grid">
-                <div class="diff-col">
-                  <div class="diff-col-header before-header">⚠ 漏洞代码模式</div>
-                  <pre class="diff-code before-code">{before_code}</pre>
-                </div>
-                <div class="diff-col">
-                  <div class="diff-col-header after-header">✓ 修复代码模式</div>
-                  <pre class="diff-code after-code">{after_code}</pre>
+                  <pre class="diff-code after-code">{_h(agg['after_code'])}</pre>
                 </div>
               </div>
             </div>"""
@@ -694,6 +705,8 @@ def generate_html(data: dict, date_str: str) -> str:
             url  = _h(_ref_url(v))
             cvss = v.get("cvss_score") or "—"
             conf = v.get("category_confidence", 0)
+            src = v.get("category_source", "")
+            src_label = {"keyword":"KW","cwe":"CWE","remap":"MAP","new":"NEW","":"?"}.get(src, src)
             vuln_rows += f"""
             <tr>
               <td><a href="{url}" target="_blank"><code>{vid}</code></a></td>
@@ -701,7 +714,7 @@ def generate_html(data: dict, date_str: str) -> str:
               <td>{_sev_badge_html(sev)}</td>
               <td>{fix}</td>
               <td class="num">{cvss}</td>
-              <td class="num">{conf:.2f}</td>
+              <td class="num" title="分类置信度 ({src_label})">{conf:.2f} <small style="color:var(--muted)">{src_label}</small></td>
               <td class="desc">{ttl}</td>
             </tr>"""
 
@@ -867,7 +880,8 @@ def generate_html(data: dict, date_str: str) -> str:
     .defense-list li {{ color: #1b5e20; }}
     /* Code diff */
     .diff-block {{ margin: 0.8rem 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
-    .diff-title {{ background: #eceff1; padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: #37474f; }}
+    .diff-title {{ background: #eceff1; padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: #37474f; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }}
+    .diff-ref {{ font-weight: normal; color: var(--muted); font-size: 0.75rem; }}
     .diff-grid {{ display: grid; grid-template-columns: 1fr 1fr; }}
     @media (max-width: 900px) {{ .diff-grid {{ grid-template-columns: 1fr; }} }}
     .diff-col {{ overflow: hidden; }}

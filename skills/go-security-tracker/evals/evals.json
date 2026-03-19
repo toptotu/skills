@@ -1,0 +1,47 @@
+{
+  "skill_name": "go-security-tracker",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我需要今天的 Go 开源项目安全日报，追踪 kubernetes、docker、etcd、helm、vault 这些项目。公司需要通过代理 http://proxy.internal.com:8080 访问外网。请抓取最近1天的数据并生成中文安全日报，输出到 /tmp/go-security-today/",
+      "expected_output": "脚本使用指定代理执行抓取，生成包含漏洞列表、严重度分布、漏洞特征分析和防御建议的 HTML+Markdown 日报，保存到 /tmp/go-security-today/。即使部分数据源抓取失败，也能基于成功的源生成报告。",
+      "files": [],
+      "assertions": [
+        "在 fetch_advisories.py 命令中正确传递 --proxy 参数",
+        "输出目录 /tmp/go-security-today/ 中生成了 .html 或 .md 格式的日报文件",
+        "日报包含执行摘要（漏洞总数和严重度分布）",
+        "日报包含漏洞特征分析章节（G-DOS / G-AUTH 等分类）",
+        "日报包含防御建议章节",
+        "运行过程中正确处理代理错误（不崩溃，有友好错误提示）"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我分析这周 kubernetes 和 argo-cd 项目的安全漏洞趋势。我想了解：1) 最近7天有哪些高危漏洞？2) 主要是哪些类型的漏洞？3) 我的代码里需要重点 review 哪些方面？生成周报保存到 /tmp/go-weekly/",
+      "expected_output": "使用 --days 7 抓取最近7天数据，聚焦 kubernetes/kubernetes 和 argoproj/argo-cd。生成周报包含：高危漏洞列表（CRITICAL/HIGH）、漏洞类型分布分析、针对本周主要漏洞类型的代码 review checklist，以及具体的防御代码示例。",
+      "files": [],
+      "assertions": [
+        "使用 --days 7 参数运行 fetch_advisories.py",
+        "生成的报告中包含 kubernetes 或 argo-cd 相关漏洞",
+        "报告中有漏洞类型分布（如 G-AUTH、G-DOS 等类型代码）",
+        "报告包含代码 review 重点提示或 checklist",
+        "报告中有针对发现漏洞类型的具体防御代码示例",
+        "/tmp/go-weekly/ 目录下有日报文件"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "帮我设置 Go 安全追踪的自动化。我在一台 Linux 服务器上，每天早上9点自动运行安全扫描，结果保存到 /data/security-reports/，公司有 NTLM 代理 http://ntlm-proxy:3128 需要认证。给我完整的配置步骤和 cron 配置。",
+      "expected_output": "提供完整的配置方案：1) 说明如何配置 NTLM 代理（需要 requests-ntlm 包），2) 展示 ~/.go-security-tracker/config.json 的配置示例，3) 提供 crontab 配置行（每天9点，设置 HTTPS_PROXY 环境变量），4) 提供验证配置的步骤（check_proxy.py）。",
+      "files": [],
+      "assertions": [
+        "提到 NTLM 代理需要安装 pip install requests-ntlm",
+        "展示了 config.json 中代理配置的正确格式",
+        "提供了 crontab 配置示例（包含正确的时间 '0 9 * * *'）",
+        "crontab 示例中包含 run_daily.py 命令",
+        "提到了 check_proxy.py 用于验证代理连通性",
+        "提供了日志路径配置（stdout/stderr 重定向）"
+      ]
+    }
+  ]
+}

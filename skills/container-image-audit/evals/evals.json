@@ -1,0 +1,49 @@
+{
+  "skill_name": "container-image-audit",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我需要对公司的 python:3.9-slim 生产镜像做渗透测试前的安全审计。要快速给我一个风险评估，重点看看有没有可以直接利用的漏洞和密钥泄露，如果发现问题给我攻击链分析。输出到 /tmp/audit-python/",
+      "expected_output": "执行三阶段审计：Phase 1 快速定性找出 CRITICAL/HIGH CVE 和密钥；Phase 2 深度分析含危险二进制清单；Phase 3 构建攻击链。报告包含整体风险评级（python:3.9-slim 应为 CRITICAL/HIGH）、P0/P1 优先级发现、危险工具清单和修复建议。",
+      "files": [],
+      "assertions": [
+        "执行了 audit_image.py 扫描 python:3.9-slim",
+        "/tmp/audit-python/ 下生成了 audit_results.json 和报告文件",
+        "报告包含整体风险等级（应为 CRITICAL 或 HIGH）",
+        "报告包含 CRITICAL/HIGH CVE 列表及 CVSS 评分",
+        "报告包含危险二进制清单（python 本身应被标记）",
+        "报告包含至少一条攻击链分析",
+        "报告包含修复优先级矩阵（P0/P1 分级）"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我审计这个 Dockerfile，找出所有安全问题并按照攻击者视角排优先级：\n```\nFROM ubuntu:20.04\nRUN apt-get update && apt-get install -y curl wget python3 nmap\nENV DB_PASSWORD=prod_secret_123\nENV AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\nRUN useradd -m appuser\nCOPY app.py /app/\nCMD [\"python3\", \"/app/app.py\"]\n```\n输出目录：/tmp/dockerfile-audit/",
+      "expected_output": "检测到多个 CRITICAL 问题：ENV 中硬编码的 DB_PASSWORD 和 AWS 密钥（P0）、安装了 curl/wget/python3/nmap 等危险工具、未设置 USER nonroot（以 root 运行）。报告中应有清晰的攻击链：密钥泄露 → AWS 横向移动，以及工具链：curl+wget+nc → 反弹 shell + 数据外泄。",
+      "files": [],
+      "assertions": [
+        "检测到 ENV DB_PASSWORD 和 ENV AWS_SECRET_ACCESS_KEY 密钥泄露",
+        "检测到 curl、wget、python3、nmap 等危险二进制",
+        "检测到容器未设置非 root 用户",
+        "密钥泄露被标记为 P0 优先级",
+        "报告包含攻击链：密钥提取 → 云服务横向移动",
+        "包含具体修复建议（移除危险工具、删除 ENV 密钥）",
+        "/tmp/dockerfile-audit/ 下生成了审计报告文件"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "对 alpine:3.18 做快速安全定性（phase quick），我只需要知道这个镜像是否安全，5分钟内给我结论，保存到 /tmp/alpine-quick/",
+      "expected_output": "使用 --phase quick 在5分钟内完成快速定性。alpine:3.18 是最小化镜像，应该显示低风险/PASS，无 CRITICAL CVE，无密钥泄露，无危险工具（Alpine 内置工具极少）。报告简短但完整，包含风险等级、CVE 统计和是否以 root 运行。",
+      "files": [],
+      "assertions": [
+        "使用 --phase quick 参数执行快速扫描",
+        "在合理时间（5分钟内）完成",
+        "/tmp/alpine-quick/ 下生成了结果文件",
+        "报告显示整体风险等级（alpine:3.18 应为 LOW 或 PASS）",
+        "报告包含 CVE 统计数据",
+        "报告包含快速定性结论"
+      ]
+    }
+  ]
+}

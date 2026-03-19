@@ -43,11 +43,12 @@
     },
     {
       "name": "security-skills",
-      "description": "Security skills: container image CIS benchmark scanning and Go open-source project daily vulnerability tracking",
+      "description": "Security skills: container image CIS benchmark scanning, deep pentest-style audit with attack chain analysis, and Go open-source project daily vulnerability tracking",
       "source": "./",
       "strict": false,
       "skills": [
         "./skills/container-image-scanner",
+        "./skills/container-image-audit",
         "./skills/go-security-tracker"
       ]
     }

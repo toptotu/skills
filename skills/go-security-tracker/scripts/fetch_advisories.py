@@ -551,29 +551,41 @@ def _cvss_vector_to_score(vector: str) -> float:
 # 漏洞分类（基于描述关键词）
 # ---------------------------------------------------------------------------
 
-CATEGORY_KEYWORDS = {
-    "G-INJ":    ["injection", "sql", "command injection", "template injection", "ldap", "注入", "命令执行"],
-    "G-AUTH":   ["authentication", "authorization", "bypass", "privilege", "rbac", "jwt", "token", "认证", "授权", "越权", "提权"],
-    "G-DOS":    ["denial of service", "dos", "resource exhaustion", "memory exhaustion", "infinite loop",
-                 "goroutine leak", "http/2 reset", "regexdos", "拒绝服务", "内存耗尽"],
-    "G-MEM":    ["memory", "buffer overflow", "use after free", "heap", "unsafe", "out of bounds", "内存"],
-    "G-PROTO":  ["protobuf", "yaml", "json", "xml", "deserialization", "parsing", "序列化", "反序列化", "解析"],
-    "G-CRYPTO": ["crypto", "certificate", "tls", "ssl", "random", "weak", "cipher", "加密", "证书", "密码学"],
-    "G-SSRF":   ["ssrf", "server-side request forgery", "redirect", "open redirect", "request forgery", "服务端请求"],
-    "G-PATH":   ["path traversal", "directory traversal", "symlink", "filepath", "路径遍历", "目录穿越"],
-    "G-RACE":   ["race condition", "race", "concurrent", "toctou", "time-of-check", "竞争", "并发"],
-    "G-SUPPLY": ["supply chain", "dependency", "module", "typosquatting", "供应链", "依赖"],
-}
-
-
 def classify_vuln(vuln: dict) -> str:
-    """根据漏洞标题和描述推断漏洞类型。"""
-    text = (vuln.get("title", "") + " " + vuln.get("description", "")).lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                return category
-    return "G-OTHER"
+    """
+    使用加权置信度模型对漏洞分类（替换旧的简单关键词匹配）。
+    支持自动识别新模式并分配 G-NEW-XXX 编号。
+    """
+    try:
+        from pattern_analyzer import classify_with_confidence, register_new_pattern, _extract_new_pattern_name
+        from datetime import datetime, timezone as _tz
+        match = classify_with_confidence(vuln)
+        if match.is_new:
+            name_zh, name_en, keywords = _extract_new_pattern_name(vuln)
+            desc = (vuln.get("description") or "")[:200]
+            date_str = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+            return register_new_pattern(vuln, name_zh, name_en, keywords, desc, date_str)
+        return match.pattern_id
+    except Exception:
+        # 降级到旧的简单匹配
+        _CATEGORY_KEYWORDS_FALLBACK = {
+            "G-INJ":    ["injection","sql","command injection","template injection","ldap"],
+            "G-AUTH":   ["authentication","authorization","bypass","privilege","rbac","jwt","token"],
+            "G-DOS":    ["denial of service","resource exhaustion","infinite loop","goroutine leak"],
+            "G-MEM":    ["buffer overflow","use after free","out of bounds","unsafe.pointer"],
+            "G-PROTO":  ["protobuf","yaml","deserialization","parsing"],
+            "G-CRYPTO": ["cryptographic","certificate","tls","insecureskipverify","weak randomness"],
+            "G-SSRF":   ["ssrf","server-side request forgery","open redirect"],
+            "G-PATH":   ["path traversal","directory traversal","symlink","zip slip"],
+            "G-RACE":   ["race condition","data race","toctou"],
+            "G-SUPPLY": ["supply chain","typosquatting","malicious package"],
+        }
+        text = (vuln.get("title","") + " " + vuln.get("description","")).lower()
+        for cat, kws in _CATEGORY_KEYWORDS_FALLBACK.items():
+            for kw in kws:
+                if kw in text:
+                    return cat
+        return "G-OTHER"
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +593,16 @@ def classify_vuln(vuln: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def fetch_all(cfg: TrackerConfig, days: int, sources: list[str],
-              repos: list[str], verbose: bool = False) -> list[dict]:
-    """从所有指定数据源抓取漏洞，去重并规范化后返回。"""
+              repos: list[str], verbose: bool = False,
+              fetch_patches: bool = True, max_patches: int = 25,
+              date_str: str = "") -> list[dict]:
+    """
+    从所有指定数据源抓取漏洞，去重规范化后进行：
+    1. 跨数据源严重度补全
+    2. 模式分类（加权置信度 + 新模式自动识别）
+    3. 代码补丁抓取（高危漏洞优先）
+    4. 结构化特征提取
+    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
     print(f"\n抓取时间范围: {since.strftime('%Y-%m-%d %H:%M UTC')} 至今（最近 {days} 天）")
     print(f"追踪项目数: {len(repos)}\n")
@@ -617,7 +637,7 @@ def fetch_all(cfg: TrackerConfig, days: int, sources: list[str],
         except Exception as e:
             print(f"    ⚠ NVD 抓取失败: {e}")
 
-    # 规范化
+    # 规范化 + 去重
     normalized = []
     seen_ids = set()
     for raw in all_raw:
@@ -628,12 +648,73 @@ def fetch_all(cfg: TrackerConfig, days: int, sources: list[str],
             continue
         if vid:
             seen_ids.add(vid)
-        # 添加漏洞分类
-        norm["category"] = classify_vuln(norm)
         normalized.append(norm)
 
-    # 跨数据源严重度补全：用 CVE/GHSA 别名关联，将有 CVSS 的条目严重度传递给无 CVSS 的同一漏洞
+    # 跨数据源严重度补全
     _enrich_severity_cross_source(normalized)
+
+    # 模式分类（加权置信度 + 新模式自动识别）
+    print("\n  [分析] 漏洞模式分类（加权置信度模型）...")
+    for norm in normalized:
+        norm["category"] = classify_vuln(norm)
+
+    # 代码补丁抓取（CRITICAL/HIGH 优先）
+    patches: dict = {}
+    if fetch_patches and max_patches > 0:
+        try:
+            from fetch_patch import batch_fetch_patches
+            patch_session = make_session(cfg)
+            if cfg.github_token:
+                patch_session.headers["Authorization"] = f"Bearer {cfg.github_token}"
+            print(f"  [补丁] 抓取代码修改对比（最多 {max_patches} 条）...")
+            patches = batch_fetch_patches(
+                normalized, patch_session,
+                max_fetch=max_patches, verbose=verbose,
+            )
+            fetched_cnt = sum(1 for p in patches.values() if p.go_diffs)
+            print(f"         成功获取 {fetched_cnt} 条 Go 代码 diff")
+        except Exception as e:
+            if verbose:
+                print(f"  [补丁] 抓取失败（跳过）: {e}")
+
+    # 结构化特征提取（漏洞模式 + 代码对比）
+    _date = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        # 确保 scripts/ 目录在 sys.path 中
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).parent)
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from pattern_analyzer import analyze_all as _analyze_all
+        normalized = _analyze_all(normalized, patches, _date)
+    except Exception as e:
+        print(f"  [分析] 特征提取模块加载失败: {type(e).__name__}: {e}")
+        print(f"         将使用空特征（漏洞分类仍有效）")
+        # 降级：从模式库生成基础特征
+        try:
+            from pattern_analyzer import (
+                PATTERN_VULN_FEATURES, PATTERN_DEFENSE_POINTS,
+                _extract_trigger_conditions, _pattern_display_name,
+            )
+            for n in normalized:
+                cat = n.get("category", "G-OTHER")
+                n["characteristics"] = {
+                    "pattern_id":   cat,
+                    "pattern_name": _pattern_display_name(cat),
+                    "is_new_pattern": cat.startswith("G-NEW-"),
+                    "vuln_features": PATTERN_VULN_FEATURES.get(cat, [])[:3],
+                    "before_code":   "",
+                    "after_code":    "",
+                    "diff_filename": "",
+                    "defense_points": PATTERN_DEFENSE_POINTS.get(cat, [])[:3],
+                    "trigger_conditions": _extract_trigger_conditions(n),
+                    "new_pattern_keywords": [],
+                    "new_pattern_description": "",
+                }
+        except Exception as e2:
+            for n in normalized:
+                if "characteristics" not in n:
+                    n["characteristics"] = {}
 
     # 按严重度排序
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4, "INFO": 5}
@@ -752,6 +833,10 @@ def main():
     parser.add_argument("--offline", action="store_true", help="离线模式，使用最新本地缓存")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
     parser.add_argument("--date", help="指定日期（格式 YYYY-MM-DD），默认今天")
+    parser.add_argument("--no-patch", action="store_true",
+                        help="跳过代码补丁抓取（更快，但报告无代码对比）")
+    parser.add_argument("--max-patches", type=int, default=25,
+                        help="最多抓取补丁的漏洞数量（默认 25）")
     args = parser.parse_args()
 
     # 加载配置
@@ -795,7 +880,13 @@ def main():
     print(f"{'='*60}")
 
     sources = [args.source] if args.source != "all" else ["all"]
-    vulns = fetch_all(cfg, args.days, sources, repos, verbose=args.verbose)
+    vulns = fetch_all(
+        cfg, args.days, sources, repos,
+        verbose=args.verbose,
+        fetch_patches=not args.no_patch,
+        max_patches=args.max_patches,
+        date_str=date_str,
+    )
 
     out_file = save_results(vulns, output_dir, date_str)
 

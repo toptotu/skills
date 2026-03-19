@@ -1,27 +1,43 @@
 #!/usr/bin/env python3
 """
-Go 安全日报生成器
-从 fetch_advisories.py 的输出 JSON 生成 HTML 和 Markdown 格式的安全日报。
-日报包含漏洞详情、特征分析、防御建议和代码 review 重点。
+Go 安全日报生成器 v2
+按「漏洞模式」组织报告，每个模式展示：
+  - 漏洞类型定义
+  - 本期漏洞特征（从描述 + code diff 提取）
+  - 代码修改前后对比（有 diff 时显示）
+  - 防御方案
+  - 本期相关 CVE 列表
+
+🆕 新发现模式用 [NEW] 标识，并附自动提取的特征说明。
 
 用法:
-    python3 scripts/generate_digest.py --raw-file ./reports/raw/2025-01-01/advisories.json \\
+    python3 scripts/generate_digest.py --raw-file ./reports/raw/<date>/advisories.json \\
         --output-dir ./reports --format both
 """
 
 import argparse
 import json
-import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import VULN_CATEGORIES, TrackerConfig
 
+try:
+    from pattern_analyzer import (
+        get_discovered_patterns,
+        PATTERN_VULN_FEATURES,
+        PATTERN_DEFENSE_POINTS,
+        _pattern_display_name,
+    )
+    _ANALYZER_AVAILABLE = True
+except ImportError:
+    _ANALYZER_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# 颜色/样式常量
+# 颜色 / 样式常量
 # ---------------------------------------------------------------------------
 
 SEVERITY_COLORS = {
@@ -30,95 +46,80 @@ SEVERITY_COLORS = {
     "MEDIUM":   "#f57f17",
     "LOW":      "#1b5e20",
     "UNKNOWN":  "#546e7a",
-    "INFO":     "#0277bd",
 }
-
 CATEGORY_COLORS = {
-    "G-INJ":    "#880e4f",
-    "G-AUTH":   "#1a237e",
-    "G-DOS":    "#b71c1c",
-    "G-MEM":    "#4a148c",
-    "G-PROTO":  "#006064",
-    "G-CRYPTO": "#1b5e20",
-    "G-SSRF":   "#e65100",
-    "G-PATH":   "#33691e",
-    "G-RACE":   "#bf360c",
-    "G-SUPPLY": "#212121",
-    "G-OTHER":  "#546e7a",
+    "G-INJ":    "#880e4f",  "G-AUTH":   "#1a237e",  "G-DOS":    "#b71c1c",
+    "G-MEM":    "#4a148c",  "G-PROTO":  "#006064",  "G-CRYPTO": "#1b5e20",
+    "G-SSRF":   "#e65100",  "G-PATH":   "#33691e",  "G-RACE":   "#bf360c",
+    "G-SUPPLY": "#212121",  "G-OTHER":  "#546e7a",
 }
+NEW_COLOR = "#7b1fa2"   # 新发现模式紫色
+NEW_BADGE = "🆕 [NEW]"
 
-SEVERITY_ICONS = {
-    "CRITICAL": "🔴",
-    "HIGH":     "🟠",
-    "MEDIUM":   "🟡",
-    "LOW":      "🟢",
-    "UNKNOWN":  "⚪",
-}
+SEV_ICONS = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🟢","UNKNOWN":"⚪"}
 
-# 漏洞类型 -> 防御建议模板
-DEFENSE_TEMPLATES = {
-    "G-INJ": """
-- 使用参数化查询，禁止字符串拼接 SQL/命令
-- 对所有外部输入进行严格类型验证和白名单过滤
-- 使用 `html/template` 而非 `text/template` 处理 HTML 输出
-- 对命令执行使用 `exec.Command` 明确参数数组而非 shell 字符串
-""",
-    "G-AUTH": """
-- 验证所有 JWT/Token 的签名算法，拒绝 `alg:none`
-- 使用最小权限原则，RBAC 策略严格审计
-- 认证和授权逻辑分离，避免在业务代码中内联权限检查
-- 使用 `crypto/subtle.ConstantTimeCompare` 比较敏感字节串
-""",
-    "G-DOS": """
-- 为所有 HTTP handler 设置 `http.TimeoutHandler` 和请求体大小限制
-- 避免在循环中无界分配内存；使用 `sync.Pool` 复用对象
-- 正则表达式使用 `regexp/syntax` 检查是否存在指数回溯
-- 对 goroutine 数量设置上限，使用 worker pool 模式
-- 开启 `net/http` 的 `MaxHeaderBytes` 和 `ReadHeaderTimeout`
-""",
-    "G-MEM": """
-- 最小化 `unsafe` 包的使用范围，所有 `unsafe.Pointer` 操作必须 review
-- cgo 边界处验证所有指针和长度，不信任 C 端数据
-- 使用 `-race` 标志和模糊测试 (`go-fuzz`/`go test -fuzz`) 检测内存问题
-""",
-    "G-PROTO": """
-- 对 Protobuf/JSON 消息设置最大大小限制，防止"解析炸弹"
-- YAML 反序列化时使用 `gopkg.in/yaml.v3` 并禁用 `!!python/object` 类型
-- 对所有反序列化结果进行二次验证，不信任来自网络的结构体字段
-""",
-    "G-CRYPTO": """
-- 使用 `crypto/rand` 而非 `math/rand` 生成密钥和 nonce
-- TLS 配置强制 `MinVersion: tls.VersionTLS12`，禁用弱 cipher suite
-- 证书校验时不要设置 `InsecureSkipVerify: true`
-- 使用 `x509.Certificate.VerifyHostname` 或标准 TLS 握手
-""",
-    "G-SSRF": """
-- 对 `http.Client` 设置自定义 `Transport`，过滤内网 IP 段（RFC 1918/loopback）
-- 白名单限制允许请求的目标域名
-- 设置重定向策略，防止跳转到内网地址：`CheckRedirect: func(...) error { return http.ErrUseLastResponse }`
-""",
-    "G-PATH": """
-- 使用 `filepath.Clean` + `filepath.Rel` 验证路径是否仍在预期目录内
-- 避免直接使用用户输入拼接文件路径
-- 使用 `os.OpenRoot`（Go 1.24+）或 `filepath.EvalSymlinks` 解析符号链接
-""",
-    "G-RACE": """
-- 使用 `-race` 进行 CI 测试，定期运行竞争检测
-- map 读写使用 `sync.RWMutex` 或 `sync.Map`
-- 状态更新使用 `sync/atomic` 原子操作
-- 避免 TOCTOU：检查和使用操作之间不能被中断，用锁保护
-""",
-    "G-SUPPLY": """
-- 启用 `go.sum` 校验，使用私有 GOPROXY 镜像
-- 定期运行 `govulncheck ./...` 扫描已知漏洞
-- 在 CI 中集成 Dependabot/Renovate 自动更新依赖
-- 审计第三方包的 import 路径，防止 typosquatting
-""",
-    "G-OTHER": """
-- 参考 OWASP Go Security Cheat Sheet 进行全面审计
-- 定期使用 `gosec`, `staticcheck`, `govulncheck` 进行静态分析
-""",
-}
+
+# ---------------------------------------------------------------------------
+# 辅助
+# ---------------------------------------------------------------------------
+
+def _h(text: str) -> str:
+    return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+
+def _sev_badge_html(sev: str) -> str:
+    c = SEVERITY_COLORS.get(sev, "#546e7a")
+    return f'<span class="badge" style="background:{c}">{_h(sev)}</span>'
+
+def _cat_color(cat: str) -> str:
+    if cat.startswith("G-NEW-"):
+        return NEW_COLOR
+    return CATEGORY_COLORS.get(cat, "#546e7a")
+
+def _cat_label(cat: str) -> str:
+    if _ANALYZER_AVAILABLE:
+        return _pattern_display_name(cat)
+    return VULN_CATEGORIES.get(cat, cat)
+
+def _is_new_pattern(cat: str) -> bool:
+    return cat.startswith("G-NEW-")
+
+def _get_pkg(v: dict) -> str:
+    for a in v.get("affected", []):
+        p = a.get("package") or ""
+        if p:
+            return p
+    raw = v.get("_raw", {})
+    for vp in raw.get("vulnerabilities", []):
+        p = vp.get("package", {}).get("name", "")
+        if p:
+            return p
+    return (v.get("id") or "")[:40]
+
+def _get_fix(v: dict) -> str:
+    for a in v.get("affected", []):
+        for fv in a.get("fixed_versions", []):
+            if isinstance(fv, dict) and fv.get("fixed"):
+                return fv["fixed"]
+        fa = a.get("fixed_at")
+        if fa:
+            return str(fa)
+    return ""
+
+def _get_vuln_range(v: dict) -> str:
+    for a in v.get("affected", []):
+        r = a.get("vulnerable_version_range", "")
+        if r:
+            return r
+        for fv in a.get("fixed_versions", []):
+            if isinstance(fv, dict) and fv.get("fixed"):
+                return f"< {fv['fixed']}"
+    return "—"
+
+def _ref_url(v: dict) -> str:
+    for r in v.get("references", []):
+        if r and r.startswith("http"):
+            return r
+    return "#"
 
 
 # ---------------------------------------------------------------------------
@@ -130,410 +131,798 @@ def load_raw(raw_file: str) -> dict:
         return json.load(f)
 
 
+def _group_by_pattern(advisories: list[dict]) -> dict[str, list[dict]]:
+    """按漏洞模式分组，已知模式在前，新模式在后，G-OTHER 最末。"""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for v in advisories:
+        groups[v.get("category", "G-OTHER")].append(v)
+
+    order = list(VULN_CATEGORIES.keys()) + [
+        k for k in groups if _is_new_pattern(k)
+    ] + ["G-OTHER"]
+    ordered = {}
+    for cat in order:
+        if cat in groups:
+            # 每组内按严重度排序
+            sev_o = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"UNKNOWN":4}
+            groups[cat].sort(key=lambda x: sev_o.get(x.get("severity","UNKNOWN"),4))
+            ordered[cat] = groups[cat]
+    return ordered
+
+
 # ---------------------------------------------------------------------------
-# Markdown 日报
+# Markdown 生成
 # ---------------------------------------------------------------------------
 
 def generate_markdown(data: dict, date_str: str) -> str:
     advisories = data.get("advisories", [])
-    sev_counts = data.get("severity_counts", {})
-    cat_counts = data.get("category_counts", {})
-    total = data.get("total", len(advisories))
+    sev_counts  = data.get("severity_counts", {})
+    total       = data.get("total", len(advisories))
+    ts          = data.get("fetch_timestamp", "")[:19]
+    groups      = _group_by_pattern(advisories)
+
+    overall = ("CRITICAL" if sev_counts.get("CRITICAL",0) > 0 else
+               "HIGH"     if sev_counts.get("HIGH",0) > 0 else
+               "MEDIUM"   if sev_counts.get("MEDIUM",0) > 0 else "LOW")
+    risk_icon = SEV_ICONS.get(overall, "⚪")
+
+    new_patterns = [cat for cat in groups if _is_new_pattern(cat)]
+    discovered   = get_discovered_patterns() if _ANALYZER_AVAILABLE else {}
 
     lines = []
 
-    # 标题
+    # ── 标题 ──────────────────────────────────────────────────
     lines += [
-        f"# Go 开源项目安全日报 — {date_str}",
+        f"# Go 开源项目安全分析报告 — {date_str}",
         "",
-        f"> 生成时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  ",
+        f"> 生成时间: {ts} UTC  ",
         f"> 数据来源: Go 官方漏洞库 / OSV.dev / GitHub Security Advisories / NVD  ",
-        f"> 覆盖项目: kubernetes, docker, etcd, helm, vault, prometheus, grafana 等 25+ 个知名 Go 项目",
-        "",
-        "---",
+        f"> 分析维度: 漏洞模式特征 + 代码修改前后对比 + 防御方案",
         "",
     ]
 
-    # 执行摘要
-    risk_icon = "🔴" if sev_counts.get("CRITICAL", 0) > 0 else \
-                "🟠" if sev_counts.get("HIGH", 0) > 0 else \
-                "🟡" if sev_counts.get("MEDIUM", 0) > 0 else "🟢"
+    if new_patterns:
+        lines += [
+            f"> 🆕 **本期新发现漏洞模式 {len(new_patterns)} 个**: "
+            + ", ".join(f"`{p}`" for p in new_patterns),
+            "",
+        ]
 
+    lines += ["---", ""]
+
+    # ── 执行摘要 ───────────────────────────────────────────────
     lines += [
         "## 执行摘要",
         "",
         f"| 指标 | 数值 |",
         f"|------|------|",
-        f"| **今日新增漏洞** | {total} |",
-        f"| **整体风险等级** | {risk_icon} {'CRITICAL' if sev_counts.get('CRITICAL',0)>0 else 'HIGH' if sev_counts.get('HIGH',0)>0 else 'MEDIUM' if sev_counts.get('MEDIUM',0)>0 else 'LOW'} |",
-        f"| 🔴 CRITICAL | {sev_counts.get('CRITICAL', 0)} |",
-        f"| 🟠 HIGH | {sev_counts.get('HIGH', 0)} |",
-        f"| 🟡 MEDIUM | {sev_counts.get('MEDIUM', 0)} |",
-        f"| 🟢 LOW | {sev_counts.get('LOW', 0)} |",
+        f"| **今日漏洞总数** | {total} |",
+        f"| **整体风险等级** | {risk_icon} **{overall}** |",
+        f"| 🔴 CRITICAL | {sev_counts.get('CRITICAL',0)} |",
+        f"| 🟠 HIGH | {sev_counts.get('HIGH',0)} |",
+        f"| 🟡 MEDIUM | {sev_counts.get('MEDIUM',0)} |",
+        f"| 🟢 LOW | {sev_counts.get('LOW',0)} |",
+        f"| 🆕 新发现模式 | {len(new_patterns)} |",
         "",
     ]
 
-    # 高危漏洞速览
-    critical_high = [v for v in advisories if v.get("severity") in ("CRITICAL", "HIGH")]
-    if critical_high:
+    # 模式分布摘要
+    if groups:
         lines += [
-            "### ⚠️ 高危漏洞速览",
+            "### 漏洞模式分布",
             "",
-            "| 编号 | 项目/包 | 严重度 | 类型 | 摘要 |",
-            "|------|---------|--------|------|------|",
+            "| 模式 | 名称 | 数量 | 最高严重度 |",
+            "|------|------|------|-----------|",
         ]
-        for v in critical_high[:10]:
-            vid = v.get("id") or v.get("cve_id") or v.get("ghsa_id") or "N/A"
-            pkg = _get_package_name(v)
-            sev = v.get("severity", "UNKNOWN")
-            cat = v.get("category", "G-OTHER")
-            cat_label = VULN_CATEGORIES.get(cat, cat)
-            title = (v.get("title") or "")[:60]
-            lines.append(f"| `{vid}` | `{pkg}` | {SEVERITY_ICONS.get(sev,'')} {sev} | {cat_label} | {title} |")
+        for cat, vulns in groups.items():
+            label = _cat_label(cat)
+            new_flag = " 🆕" if _is_new_pattern(cat) else ""
+            top_sev = next((v.get("severity","") for v in vulns
+                            if v.get("severity") in ("CRITICAL","HIGH")),
+                           vulns[0].get("severity","") if vulns else "")
+            sev_icon = SEV_ICONS.get(top_sev, "⚪")
+            lines.append(f"| `{cat}`{new_flag} | {label} | {len(vulns)} | {sev_icon} {top_sev} |")
+        lines += ["", "---", ""]
+
+    # ── 漏洞模式详细分析 ────────────────────────────────────────
+    lines += ["## 漏洞模式详细分析", ""]
+
+    for cat, vulns in groups.items():
+        if cat == "G-OTHER":
+            continue  # G-OTHER 放到附录
+
+        label    = _cat_label(cat)
+        is_new   = _is_new_pattern(cat)
+        new_flag = f" {NEW_BADGE}" if is_new else ""
+        color_flag = "🆕 " if is_new else ""
+        high_count = sum(1 for v in vulns if v.get("severity") in ("CRITICAL","HIGH"))
+
+        lines += [
+            f"### {color_flag}`{cat}` — {label}{new_flag}",
+            "",
+        ]
+
+        # 新模式说明
+        if is_new and cat in discovered:
+            dp = discovered[cat]
+            lines += [
+                f"> **新发现模式说明**: {dp.description or '从本期漏洞自动识别的新模式'}  ",
+                f"> 首次发现于: `{dp.first_seen}` ({dp.first_date}) | 本期出现: {len(vulns)} 次  ",
+                f"> 关键特征词: {', '.join(f'`{k}`' for k in dp.keywords[:6])}",
+                "",
+            ]
+
+        lines += [
+            f"**本期漏洞数**: {len(vulns)} 条（CRITICAL/HIGH: {high_count} 条）",
+            "",
+        ]
+
+        # ── 漏洞特征 ──
+        lines += ["#### 漏洞特征", ""]
+
+        # 聚合本组漏洞的 characteristics
+        all_features = []
+        for v in vulns:
+            char = v.get("characteristics", {})
+            for feat in char.get("vuln_features", []):
+                if feat not in all_features:
+                    all_features.append(feat)
+
+        if all_features:
+            for feat in all_features[:5]:
+                lines.append(f"- {feat}")
+        else:
+            for feat in PATTERN_VULN_FEATURES.get(cat, ["参见漏洞描述"])[:4]:
+                lines.append(f"- {feat}")
         lines.append("")
 
-    lines.append("---")
-    lines.append("")
-
-    # 漏洞详情
-    lines += ["## 漏洞详情", ""]
-
-    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-        group = [v for v in advisories if v.get("severity") == sev]
-        if not group:
-            continue
-        lines += [
-            f"### {SEVERITY_ICONS.get(sev, '')} {sev} （{len(group)} 条）",
-            "",
-        ]
-        for v in group:
-            vid = v.get("id") or v.get("cve_id") or v.get("ghsa_id") or "N/A"
-            cve = v.get("cve_id", "")
-            ghsa = v.get("ghsa_id", "")
-            pkg = _get_package_name(v)
-            fix = _get_fix_version(v)
-            cat = VULN_CATEGORIES.get(v.get("category", "G-OTHER"), "其他")
-            desc = (v.get("description") or "暂无描述")[:400]
-            refs = v.get("references", [])
-            ref_links = " / ".join(f"[链接]({r})" for r in refs[:3] if r)
-            cwes = v.get("cwes", [])
-            cvss = v.get("cvss_score")
-
-            lines += [
-                f"#### `{vid}`",
-                "",
-                f"- **类型**: {cat}",
-                f"- **受影响包**: `{pkg}`",
-            ]
-            if cve and cve != vid:
-                lines.append(f"- **CVE**: `{cve}`")
-            if ghsa and ghsa != vid:
-                lines.append(f"- **GHSA**: `{ghsa}`")
-            if cvss:
-                lines.append(f"- **CVSS 评分**: {cvss}")
-            if cwes:
-                lines.append(f"- **CWE**: {', '.join(cwes)}")
-            lines += [
-                f"- **修复版本**: {fix or '请关注项目发布页'}",
-                f"- **漏洞描述**: {desc}",
-            ]
-            if ref_links:
-                lines.append(f"- **参考链接**: {ref_links}")
+        # ── 触发条件 ──
+        trigger_set = set()
+        for v in vulns:
+            for t in v.get("characteristics", {}).get("trigger_conditions", []):
+                trigger_set.add(t)
+        if trigger_set:
+            lines += ["**触发条件**:", ""]
+            for t in list(trigger_set)[:3]:
+                lines.append(f"- {t}")
             lines.append("")
 
-    lines.append("---")
-    lines.append("")
-
-    # 漏洞特征分析
-    lines += ["## 漏洞特征分析", ""]
-
-    if cat_counts:
-        lines += [
-            "### 本期漏洞类型分布",
-            "",
-            "| 类型 | 数量 | 说明 |",
-            "|------|------|------|",
+        # ── 代码修改前后对比 ──
+        # 找到有 diff 的漏洞
+        vuln_with_diff = [
+            v for v in vulns
+            if v.get("characteristics", {}).get("before_code")
+               or v.get("characteristics", {}).get("after_code")
         ]
-        for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1]):
-            label = VULN_CATEGORIES.get(cat, cat)
-            lines.append(f"| {cat} | {count} | {label} |")
+
+        if vuln_with_diff:
+            lines += ["#### 代码修改对比（典型案例）", ""]
+            # 选最严重的那条
+            example = vuln_with_diff[0]
+            char = example.get("characteristics", {})
+            vid  = example.get("id") or example.get("cve_id") or ""
+            fname = char.get("diff_filename", "")
+            lines += [
+                f"> 来源: `{vid}`"
+                + (f" — `{fname}`" if fname else ""),
+                "",
+            ]
+            if char.get("before_code"):
+                lines += [
+                    "**修改前（存在漏洞）**:",
+                    "```go",
+                    char["before_code"],
+                    "```",
+                    "",
+                ]
+            if char.get("after_code"):
+                lines += [
+                    "**修改后（已修复）**:",
+                    "```go",
+                    char["after_code"],
+                    "```",
+                    "",
+                ]
+        else:
+            # 无 diff 时从模式库提供示例
+            lines += _pattern_code_example_md(cat)
+
+        # ── 防御方案 ──
+        lines += ["#### 防御方案", ""]
+
+        all_defense = []
+        for v in vulns:
+            for d in v.get("characteristics", {}).get("defense_points", []):
+                if d not in all_defense:
+                    all_defense.append(d)
+
+        if all_defense:
+            for d in all_defense[:5]:
+                lines.append(f"- {d}")
+        else:
+            for d in PATTERN_DEFENSE_POINTS.get(cat, ["参见 references/go_vuln_patterns.md"])[:4]:
+                lines.append(f"- {d}")
         lines.append("")
 
-    # 主要漏洞模式
-    dominant_cats = [cat for cat, _ in sorted(cat_counts.items(), key=lambda x: -x[1])[:3]] if cat_counts else []
-    if dominant_cats:
+        # ── 本期相关漏洞 ──
+        lines += [f"#### 本期相关漏洞（{len(vulns)} 条）", ""]
         lines += [
-            "### 主要漏洞模式",
+            "| 编号 | 受影响包 | 严重度 | 修复版本 | 摘要 |",
+            "|------|---------|--------|---------|------|",
+        ]
+        for v in vulns[:15]:
+            vid  = v.get("id") or v.get("cve_id") or v.get("ghsa_id") or "N/A"
+            pkg  = _get_pkg(v)[:40]
+            sev  = v.get("severity", "UNKNOWN")
+            fix  = _get_fix(v) or "—"
+            ttl  = (v.get("title") or "")[:55]
+            url  = _ref_url(v)
+            lines.append(f"| [`{vid}`]({url}) | `{pkg}` | {SEV_ICONS.get(sev,'')} {sev} | {fix} | {ttl} |")
+        if len(vulns) > 15:
+            lines.append(f"| ... | *（另有 {len(vulns)-15} 条）* | | | |")
+        lines += ["", "---", ""]
+
+    # ── 新模式汇总 ──
+    if new_patterns:
+        lines += [
+            "## 🆕 新发现漏洞模式汇总",
+            "",
+            "以下模式为本期自动识别，不在预定义的 10 类模式库中，已自动补充到本地模式库：",
+            "",
+            "| 模式 ID | 名称 | 首见漏洞 | 关键特征词 |",
+            "|---------|------|---------|----------|",
+        ]
+        for cat in new_patterns:
+            dp = discovered.get(cat)
+            if dp:
+                kws = ", ".join(f"`{k}`" for k in dp.keywords[:5])
+                lines.append(f"| `{cat}` | {dp.name_zh} | `{dp.first_seen}` | {kws} |")
+            else:
+                lines.append(f"| `{cat}` | 新模式 | — | — |")
+        lines += [
+            "",
+            "> 模式库保存路径: `~/.go-security-tracker/discovered_patterns.json`",
+            "",
+            "---",
             "",
         ]
-        for cat in dominant_cats:
-            label = VULN_CATEGORIES.get(cat, cat)
-            count = cat_counts.get(cat, 0)
-            lines += [
-                f"**{cat} — {label}**（本期 {count} 条）",
-                "",
-                _get_pattern_summary(cat),
-                "",
-            ]
 
-    lines.append("---")
-    lines.append("")
-
-    # 防御建议
-    lines += ["## 防御建议", ""]
-
-    if dominant_cats:
+    # ── 全部漏洞按严重度列表 ──
+    lines += ["## 漏洞列表（按严重度）", ""]
+    crit_high = [v for v in advisories if v.get("severity") in ("CRITICAL","HIGH")]
+    if crit_high:
         lines += [
-            "### 针对本期漏洞的加固措施",
+            "### 🔴🟠 CRITICAL / HIGH",
             "",
+            "| 编号 | 受影响包 | 严重度 | 模式 | CVSS | 修复版本 | 摘要 |",
+            "|------|---------|--------|------|------|---------|------|",
         ]
-        for cat in dominant_cats:
-            label = VULN_CATEGORIES.get(cat, cat)
-            defense = DEFENSE_TEMPLATES.get(cat, DEFENSE_TEMPLATES["G-OTHER"]).strip()
-            lines += [
-                f"#### {cat} — {label}",
-                "",
-                defense,
-                "",
-            ]
+        for v in crit_high[:30]:
+            vid  = v.get("id") or v.get("cve_id") or "N/A"
+            pkg  = _get_pkg(v)[:35]
+            sev  = v.get("severity","UNKNOWN")
+            cat  = v.get("category","G-OTHER")
+            cvss = v.get("cvss_score") or "—"
+            fix  = _get_fix(v) or "—"
+            ttl  = (v.get("title") or "")[:50]
+            new_f = " 🆕" if _is_new_pattern(cat) else ""
+            url  = _ref_url(v)
+            lines.append(
+                f"| [`{vid}`]({url}) | `{pkg}` | {SEV_ICONS.get(sev,'')} {sev} "
+                f"| `{cat}`{new_f} | {cvss} | {fix} | {ttl} |"
+            )
+        lines.append("")
 
-    lines += [
-        "### 通用 Go 安全加固 Checklist",
-        "",
-        "- [ ] 运行 `govulncheck ./...` 检查已知漏洞",
-        "- [ ] CI 中启用 `-race` 标志",
-        "- [ ] 审计 `unsafe` 包使用位置",
-        "- [ ] 检查所有 HTTP handler 的超时和大小限制",
-        "- [ ] 验证 TLS 配置（MinVersion, cipher suites）",
-        "- [ ] 检查所有反序列化入口点（JSON/YAML/Protobuf）",
-        "- [ ] 审查文件操作的路径规范化逻辑",
-        "- [ ] 确认所有随机数生成使用 `crypto/rand`",
-        "",
-    ]
-
-    # 依赖升级清单
-    fixable = [v for v in advisories if _get_fix_version(v) and v.get("severity") in ("CRITICAL", "HIGH")]
+    # ── 依赖升级清单 ──
+    fixable = [v for v in advisories
+               if _get_fix(v) and v.get("severity") in ("CRITICAL","HIGH")]
     if fixable:
         lines += [
-            "### 依赖升级清单（CRITICAL/HIGH 有修复版本）",
+            "## 依赖升级清单（CRITICAL/HIGH 有修复版本）",
             "",
-            "| 包名 | 当前受影响版本 | 修复版本 | CVE/GHSA |",
-            "|------|--------------|---------|---------|",
+            "| 包名 | 受影响版本 | 升级到 | 严重度 | 编号 |",
+            "|------|-----------|-------|--------|------|",
         ]
-        seen_pkgs = set()
-        for v in fixable[:20]:
-            pkg = _get_package_name(v)
+        seen_pkgs: set[str] = set()
+        for v in fixable[:25]:
+            pkg = _get_pkg(v)
             if pkg in seen_pkgs:
                 continue
             seen_pkgs.add(pkg)
-            fix = _get_fix_version(v)
-            vid = v.get("cve_id") or v.get("ghsa_id") or v.get("id") or "N/A"
-            vuln_range = _get_vuln_range(v)
-            lines.append(f"| `{pkg}` | {vuln_range} | **{fix}** | `{vid}` |")
+            fix  = _get_fix(v)
+            sev  = v.get("severity","UNKNOWN")
+            vid  = v.get("cve_id") or v.get("ghsa_id") or v.get("id") or "N/A"
+            vr   = _get_vuln_range(v)
+            lines.append(f"| `{pkg}` | {vr} | **{fix}** | {sev} | `{vid}` |")
         lines.append("")
 
-    lines.append("---")
-    lines.append("")
-
-    # 附录
-    lines += [
-        "## 附录",
-        "",
-        "### 数据来源说明",
-        "",
-        "| 来源 | URL | 说明 |",
-        "|------|-----|------|",
-        "| Go 官方漏洞库 | https://vuln.go.dev | Go 团队维护的权威漏洞数据库 |",
-        "| OSV.dev | https://osv.dev | 开源漏洞数据库，覆盖 Go 生态 |",
-        "| GitHub Advisory | https://github.com/advisories | GitHub 安全公告数据库 |",
-        "| NVD | https://nvd.nist.gov | NIST 国家漏洞数据库 |",
-        "",
-        "### 漏洞类型编码说明",
-        "",
-        "| 编码 | 含义 |",
-        "|------|------|",
-    ]
-    for code, desc in VULN_CATEGORIES.items():
-        lines.append(f"| `{code}` | {desc} |")
-    lines.append("")
+    # ── G-OTHER ──
+    other = groups.get("G-OTHER", [])
+    if other:
+        lines += [
+            "## 附录：未分类漏洞（G-OTHER）",
+            "",
+            f"共 {len(other)} 条，置信度不足以归入已有模式：",
+            "",
+            "| 编号 | 包 | 严重度 | 摘要 |",
+            "|------|---|--------|------|",
+        ]
+        for v in other[:20]:
+            vid = v.get("id") or v.get("cve_id") or "N/A"
+            pkg = _get_pkg(v)[:30]
+            sev = v.get("severity","UNKNOWN")
+            ttl = (v.get("title") or "")[:55]
+            lines.append(f"| `{vid}` | `{pkg}` | {SEV_ICONS.get(sev,'')} {sev} | {ttl} |")
+        lines.append("")
 
     return "\n".join(lines)
 
 
+def _pattern_code_example_md(cat: str) -> list[str]:
+    """当无实际 diff 时，从参考库提供代码对比示例。"""
+    examples = {
+        "G-AUTH": [
+            "**典型漏洞模式（修改前）**:",
+            "```go",
+            "// 未校验 JWT 算法类型",
+            'token, _ := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {',
+            '    return secretKey, nil  // 未检查 t.Method 类型！',
+            '})',
+            "```",
+            "",
+            "**修复后**:",
+            "```go",
+            "token, _ := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {",
+            '    if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {',
+            '        return nil, fmt.Errorf("unexpected alg: %v", t.Header["alg"])',
+            "    }",
+            "    return secretKey, nil",
+            "})",
+            "```",
+            "",
+        ],
+        "G-DOS": [
+            "**典型漏洞模式（修改前）**:",
+            "```go",
+            "// HTTP handler 未限制请求体大小",
+            "body, _ := io.ReadAll(r.Body)  // 可被大文件耗尽内存",
+            "```",
+            "",
+            "**修复后**:",
+            "```go",
+            "r.Body = http.MaxBytesReader(w, r.Body, 10<<20)  // 限制 10MB",
+            "body, err := io.ReadAll(r.Body)",
+            "```",
+            "",
+        ],
+        "G-PATH": [
+            "**典型漏洞模式（修改前）**:",
+            "```go",
+            "// filepath.Join 可被绝对路径绕过",
+            "fullPath := filepath.Join(baseDir, userInput)",
+            "http.ServeFile(w, r, fullPath)  // 危险！",
+            "```",
+            "",
+            "**修复后**:",
+            "```go",
+            "clean := filepath.Clean(userInput)",
+            "rel, err := filepath.Rel(baseDir, filepath.Join(baseDir, clean))",
+            'if err != nil || strings.HasPrefix(rel, "..") {',
+            '    http.Error(w, "forbidden", 403); return',
+            "}",
+            "```",
+            "",
+        ],
+        "G-SSRF": [
+            "**典型漏洞模式（修改前）**:",
+            "```go",
+            "// 直接使用用户输入 URL",
+            "resp, _ := http.Get(req.FormValue(\"url\"))  // 可访问内网！",
+            "```",
+            "",
+            "**修复后**:",
+            "```go",
+            "// 使用自定义 Transport 过滤私有地址",
+            "client := newSafeHTTPClient()  // 过滤 10.x / 172.x / 192.168.x / 169.254.x",
+            "resp, err := client.Get(validatedURL)",
+            "```",
+            "",
+        ],
+        "G-CRYPTO": [
+            "**典型漏洞模式（修改前）**:",
+            "```go",
+            "// 使用不安全的随机数",
+            "token := fmt.Sprintf(\"%d\", rand.Int63())  // math/rand 可预测！",
+            "```",
+            "",
+            "**修复后**:",
+            "```go",
+            "b := make([]byte, 32)",
+            "if _, err := crand.Read(b); err != nil { ... }  // crypto/rand",
+            "token := hex.EncodeToString(b)",
+            "```",
+            "",
+        ],
+    }
+    return examples.get(cat, [])
+
+
 # ---------------------------------------------------------------------------
-# HTML 日报
+# HTML 生成
 # ---------------------------------------------------------------------------
 
 def generate_html(data: dict, date_str: str) -> str:
     advisories = data.get("advisories", [])
-    sev_counts = data.get("severity_counts", {})
-    cat_counts = data.get("category_counts", {})
-    total = data.get("total", len(advisories))
+    sev_counts  = data.get("severity_counts", {})
+    total       = data.get("total", len(advisories))
+    ts          = data.get("fetch_timestamp", "")[:19]
+    groups      = _group_by_pattern(advisories)
 
-    def h(text: str) -> str:
-        return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    overall = ("CRITICAL" if sev_counts.get("CRITICAL",0) > 0 else
+               "HIGH"     if sev_counts.get("HIGH",0) > 0 else
+               "MEDIUM"   if sev_counts.get("MEDIUM",0) > 0 else "LOW")
+    risk_color   = SEVERITY_COLORS.get(overall, "#546e7a")
+    new_patterns = [cat for cat in groups if _is_new_pattern(cat)]
+    discovered   = get_discovered_patterns() if _ANALYZER_AVAILABLE else {}
 
-    def sev_badge(sev: str) -> str:
-        c = SEVERITY_COLORS.get(sev, "#546e7a")
-        return f'<span class="badge" style="background:{c}">{h(sev)}</span>'
+    # ── 导航链接 ──────────────────────────────────────────────
+    nav_links = "".join(
+        f'<a href="#pat-{cat}">'
+        f'{"🆕 " if _is_new_pattern(cat) else ""}'
+        f'{_cat_label(cat)} ({len(vulns)})</a>'
+        for cat, vulns in groups.items()
+        if cat != "G-OTHER"
+    )
 
-    def cat_badge(cat: str) -> str:
-        c = CATEGORY_COLORS.get(cat, "#546e7a")
-        label = VULN_CATEGORIES.get(cat, cat)
-        return f'<span class="badge badge-cat" style="background:{c}">{h(label)}</span>'
+    # ── 模式摘要卡片 ─────────────────────────────────────────
+    pattern_cards = ""
+    for cat, vulns in groups.items():
+        color = _cat_color(cat)
+        label = _cat_label(cat)
+        is_new = _is_new_pattern(cat)
+        high_cnt = sum(1 for v in vulns if v.get("severity") in ("CRITICAL","HIGH"))
+        pattern_cards += f"""
+        <div class="pat-card" onclick="location.href='#pat-{_h(cat)}'">
+          <div class="pat-card-header" style="background:{color}">
+            <span class="pat-id">{_h(cat)}</span>
+            {"<span class='new-badge'>NEW</span>" if is_new else ""}
+          </div>
+          <div class="pat-card-body">
+            <div class="pat-name">{_h(label)}</div>
+            <div class="pat-count">{len(vulns)} 条</div>
+            <div class="pat-high">{'⚠ ' + str(high_cnt) + ' CRITICAL/HIGH' if high_cnt else '无高危'}</div>
+          </div>
+        </div>"""
 
-    critical_high = [v for v in advisories if v.get("severity") in ("CRITICAL", "HIGH")]
-    dominant_cats = [cat for cat, _ in sorted(cat_counts.items(), key=lambda x: -x[1])[:5]] if cat_counts else []
+    # ── 模式详情块 ─────────────────────────────────────────────
+    pattern_sections = ""
+    for cat, vulns in groups.items():
+        if cat == "G-OTHER":
+            continue
 
-    overall_risk = "CRITICAL" if sev_counts.get("CRITICAL", 0) > 0 else \
-                   "HIGH" if sev_counts.get("HIGH", 0) > 0 else \
-                   "MEDIUM" if sev_counts.get("MEDIUM", 0) > 0 else "LOW"
-    risk_color = SEVERITY_COLORS.get(overall_risk, "#546e7a")
+        color   = _cat_color(cat)
+        label   = _cat_label(cat)
+        is_new  = _is_new_pattern(cat)
+        dp      = discovered.get(cat) if is_new else None
 
-    # 构建漏洞详情行
-    vuln_rows = ""
-    for v in advisories[:200]:
-        vid = h(v.get("id") or v.get("cve_id") or v.get("ghsa_id") or "N/A")
-        pkg = h(_get_package_name(v))
-        sev = v.get("severity", "UNKNOWN")
-        cat = v.get("category", "G-OTHER")
-        title = h((v.get("title") or "")[:80])
-        fix = h(_get_fix_version(v) or "—")
-        cvss = v.get("cvss_score") or "—"
-        desc = h((v.get("description") or "")[:300])
-        ref_url = next((r for r in v.get("references", []) if r), "#")
+        # 聚合特征
+        all_features: list[str] = []
+        all_triggers: list[str] = []
+        all_defense:  list[str] = []
+        for v in vulns:
+            char = v.get("characteristics", {})
+            for f in char.get("vuln_features", []):
+                if f not in all_features: all_features.append(f)
+            for t in char.get("trigger_conditions", []):
+                if t not in all_triggers: all_triggers.append(t)
+            for d in char.get("defense_points", []):
+                if d not in all_defense: all_defense.append(d)
 
-        vuln_rows += f"""
-        <tr class="sev-{sev.lower()}">
-          <td><a href="{h(ref_url)}" target="_blank"><code>{vid}</code></a></td>
-          <td><code>{pkg}</code></td>
-          <td>{sev_badge(sev)}</td>
-          <td>{cat_badge(cat)}</td>
-          <td>{h(fix)}</td>
-          <td class="num">{cvss}</td>
-          <td class="desc">{title}</td>
-        </tr>
-        <tr class="desc-row">
-          <td colspan="7" class="desc-cell">{desc}</td>
+        if not all_features:
+            all_features = PATTERN_VULN_FEATURES.get(cat, [])
+        if not all_defense:
+            all_defense = PATTERN_DEFENSE_POINTS.get(cat, [])
+
+        feature_items = "".join(f"<li>{_h(f)}</li>" for f in all_features[:5])
+        trigger_items = "".join(f"<li>{_h(t)}</li>" for t in all_triggers[:3])
+        defense_items = "".join(f"<li>{_h(d)}</li>" for d in all_defense[:5])
+
+        # 代码 diff（找第一个有 diff 的漏洞）
+        diff_section = ""
+        vuln_with_diff = [v for v in vulns
+                          if v.get("characteristics", {}).get("before_code")
+                          or v.get("characteristics", {}).get("after_code")]
+        if vuln_with_diff:
+            ex = vuln_with_diff[0]
+            char = ex.get("characteristics", {})
+            vid_ex = _h(ex.get("id") or ex.get("cve_id") or "")
+            fname  = _h(char.get("diff_filename",""))
+            before = _h(char.get("before_code",""))
+            after  = _h(char.get("after_code",""))
+            diff_section = f"""
+            <div class="diff-block">
+              <div class="diff-title">代码修改对比 — <code>{vid_ex}</code> {('— '+fname) if fname else ''}</div>
+              <div class="diff-grid">
+                <div class="diff-col">
+                  <div class="diff-col-header before-header">⚠ 修改前（存在漏洞）</div>
+                  <pre class="diff-code before-code">{before}</pre>
+                </div>
+                <div class="diff-col">
+                  <div class="diff-col-header after-header">✓ 修改后（已修复）</div>
+                  <pre class="diff-code after-code">{after}</pre>
+                </div>
+              </div>
+            </div>"""
+        else:
+            # 无实际 diff，使用模式库示例
+            eg_lines = _pattern_code_example_md(cat)
+            if eg_lines:
+                before_lines: list[str] = []
+                after_lines:  list[str] = []
+                in_before = False; in_after = False
+                for ln in eg_lines:
+                    if "修改前" in ln: in_before = True; in_after = False; continue
+                    if "修改后" in ln: in_after = True; in_before = False; continue
+                    if ln.startswith("```"): continue
+                    if in_before: before_lines.append(ln)
+                    elif in_after: after_lines.append(ln)
+                before_code = _h("\n".join(before_lines))
+                after_code  = _h("\n".join(after_lines))
+                diff_section = f"""
+            <div class="diff-block">
+              <div class="diff-title">典型代码模式示例（来自模式库）</div>
+              <div class="diff-grid">
+                <div class="diff-col">
+                  <div class="diff-col-header before-header">⚠ 漏洞代码模式</div>
+                  <pre class="diff-code before-code">{before_code}</pre>
+                </div>
+                <div class="diff-col">
+                  <div class="diff-col-header after-header">✓ 修复代码模式</div>
+                  <pre class="diff-code after-code">{after_code}</pre>
+                </div>
+              </div>
+            </div>"""
+
+        # 本期相关漏洞表格
+        vuln_rows = ""
+        for v in vulns[:20]:
+            vid  = _h(v.get("id") or v.get("cve_id") or v.get("ghsa_id") or "N/A")
+            pkg  = _h(_get_pkg(v)[:40])
+            sev  = v.get("severity","UNKNOWN")
+            fix  = _h(_get_fix(v) or "—")
+            ttl  = _h((v.get("title") or "")[:70])
+            url  = _h(_ref_url(v))
+            cvss = v.get("cvss_score") or "—"
+            conf = v.get("category_confidence", 0)
+            vuln_rows += f"""
+            <tr>
+              <td><a href="{url}" target="_blank"><code>{vid}</code></a></td>
+              <td><code>{pkg}</code></td>
+              <td>{_sev_badge_html(sev)}</td>
+              <td>{fix}</td>
+              <td class="num">{cvss}</td>
+              <td class="num">{conf:.2f}</td>
+              <td class="desc">{ttl}</td>
+            </tr>"""
+
+        # 新模式说明框
+        new_info = ""
+        if is_new and dp:
+            kws = ", ".join(f"<code>{_h(k)}</code>" for k in dp.keywords[:6])
+            new_info = f"""
+            <div class="new-pattern-info">
+              <div class="new-pattern-title">🆕 新发现模式 — 自动识别说明</div>
+              <p><strong>描述</strong>: {_h(dp.description or '从本期漏洞自动识别')}</p>
+              <p><strong>首次发现</strong>: <code>{_h(dp.first_seen)}</code> ({_h(dp.first_date)})</p>
+              <p><strong>关键特征词</strong>: {kws}</p>
+              <p><strong>本期出现次数</strong>: {len(vulns)}</p>
+              <p class="muted">此模式已自动追加到本地模式库 ~/.go-security-tracker/discovered_patterns.json</p>
+            </div>"""
+
+        pattern_sections += f"""
+        <section class="pattern-section" id="pat-{_h(cat)}">
+          <div class="pattern-header" style="border-left:5px solid {color}">
+            <div class="pattern-title-row">
+              <span class="pattern-id-badge" style="background:{color}">{_h(cat)}</span>
+              <h2 class="pattern-name">{_h(label)}
+                {"<span class='new-tag'>🆕 NEW</span>" if is_new else ""}
+              </h2>
+              <span class="pattern-count">{len(vulns)} 条</span>
+            </div>
+          </div>
+          {new_info}
+
+          <div class="pattern-body">
+            <div class="analysis-grid">
+
+              <div class="analysis-col">
+                <div class="analysis-card">
+                  <h3 class="card-title vuln-title">⚠ 漏洞特征</h3>
+                  <ul class="feature-list">{feature_items}</ul>
+                </div>
+                {"<div class='analysis-card trigger-card'><h3 class='card-title'>触发条件</h3><ul class='feature-list'>" + trigger_items + "</ul></div>" if trigger_items else ""}
+              </div>
+
+              <div class="analysis-col">
+                <div class="analysis-card">
+                  <h3 class="card-title defense-title">🛡 防御方案</h3>
+                  <ul class="feature-list defense-list">{defense_items}</ul>
+                </div>
+              </div>
+
+            </div>
+
+            {diff_section}
+
+            <div class="vuln-table-wrapper">
+              <h3>本期相关漏洞（{len(vulns)} 条）</h3>
+              <table>
+                <thead>
+                  <tr><th>编号</th><th>受影响包</th><th>严重度</th><th>修复版本</th>
+                      <th>CVSS</th><th>置信度</th><th>摘要</th></tr>
+                </thead>
+                <tbody>{vuln_rows}</tbody>
+              </table>
+              {"<p class='muted'>…另有 " + str(len(vulns)-20) + " 条，见原始 JSON</p>" if len(vulns)>20 else ""}
+            </div>
+          </div>
+        </section>"""
+
+    # ── 依赖升级清单 ──────────────────────────────────────────
+    fixable = [v for v in advisories
+               if _get_fix(v) and v.get("severity") in ("CRITICAL","HIGH")]
+    upgrade_rows = ""
+    seen_pkgs: set[str] = set()
+    for v in fixable[:30]:
+        pkg = _get_pkg(v)
+        if pkg in seen_pkgs: continue
+        seen_pkgs.add(pkg)
+        fix  = _h(_get_fix(v))
+        sev  = v.get("severity","UNKNOWN")
+        vid  = _h(v.get("cve_id") or v.get("ghsa_id") or v.get("id") or "N/A")
+        vr   = _h(_get_vuln_range(v))
+        upgrade_rows += f"""
+        <tr>
+          <td><code>{_h(pkg)}</code></td>
+          <td><code>{vr}</code></td>
+          <td><strong>{fix}</strong></td>
+          <td>{_sev_badge_html(sev)}</td>
+          <td><code>{vid}</code></td>
         </tr>"""
 
-    # 防御建议卡片
-    defense_cards = ""
-    for cat in dominant_cats:
-        label = VULN_CATEGORIES.get(cat, cat)
-        color = CATEGORY_COLORS.get(cat, "#546e7a")
-        defense = DEFENSE_TEMPLATES.get(cat, DEFENSE_TEMPLATES["G-OTHER"]).strip()
-        defense_html = "<br>".join(
-            f"<li>{h(line[2:].strip())}</li>" if line.startswith("- ") else h(line)
-            for line in defense.split("\n") if line.strip()
-        )
-        defense_cards += f"""
-        <div class="defense-card">
-          <div class="defense-header" style="background:{color}">
-            <strong>{h(cat)}</strong> — {h(label)}
-          </div>
-          <ul class="defense-list">{defense_html}</ul>
-        </div>"""
+    upgrade_section = f"""
+    <section id="upgrade">
+      <h2>依赖升级清单</h2>
+      <p class="muted">以下 CRITICAL/HIGH 漏洞已有修复版本，建议立即升级：</p>
+      {"<p class='muted'>本期无高危可修复漏洞。</p>" if not upgrade_rows else
+       "<table><thead><tr><th>包名</th><th>受影响版本</th><th>升级到</th><th>严重度</th><th>编号</th></tr></thead><tbody>"
+       + upgrade_rows + "</tbody></table>"}
+    </section>"""
 
-    # 分类统计图（纯 CSS 进度条）
-    cat_bars = ""
-    max_cat = max(cat_counts.values()) if cat_counts else 1
-    for cat, count in sorted(cat_counts.items(), key=lambda x: -x[1])[:8]:
-        label = VULN_CATEGORIES.get(cat, cat)
-        pct = count / max_cat * 100
-        color = CATEGORY_COLORS.get(cat, "#546e7a")
-        cat_bars += f"""
-        <div class="bar-row">
-          <div class="bar-label">{h(cat)}</div>
-          <div class="bar-track">
-            <div class="bar-fill" style="width:{pct:.0f}%;background:{color}"></div>
-          </div>
-          <div class="bar-count">{count}</div>
-          <div class="bar-desc">{h(label)}</div>
-        </div>"""
+    # ── 新模式汇总 ────────────────────────────────────────────
+    new_summary = ""
+    if new_patterns:
+        rows = ""
+        for cat in new_patterns:
+            dp = discovered.get(cat)
+            if dp:
+                kws = ", ".join(f"<code>{_h(k)}</code>" for k in dp.keywords[:5])
+                rows += f"<tr><td><code>{_h(cat)}</code></td><td>{_h(dp.name_zh)}</td><td><code>{_h(dp.first_seen)}</code></td><td>{kws}</td></tr>"
+        new_summary = f"""
+    <section id="new-patterns">
+      <h2>🆕 新发现漏洞模式汇总</h2>
+      <p>以下模式为本期自动识别，已自动追加到本地模式库：</p>
+      <table>
+        <thead><tr><th>模式 ID</th><th>名称</th><th>首见漏洞</th><th>关键特征词</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p class="muted">模式库路径: <code>~/.go-security-tracker/discovered_patterns.json</code></p>
+    </section>"""
+
+    # ── CSS & JS ──────────────────────────────────────────────
+    css = f"""
+    :root {{
+      --font: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      --bg: #f4f6f8; --card: #fff; --border: #dde3ec; --text: #1a202c; --muted: #718096;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.7; font-size: 14px; }}
+    header {{ background: #1a1a2e; color: white; padding: 1.4rem 2rem; border-bottom: 4px solid {risk_color}; }}
+    header h1 {{ font-size: 1.4rem; }} header .meta {{ color: #b0bec5; font-size: 0.8rem; margin-top: 0.2rem; }}
+    nav {{ background: #16213e; padding: 0.4rem 2rem; display: flex; gap: 1rem; flex-wrap: wrap; overflow-x: auto; }}
+    nav a {{ color: #90caf9; text-decoration: none; font-size: 0.8rem; white-space: nowrap; padding: 0.2rem 0; }}
+    nav a:hover {{ color: white; }}
+    main {{ max-width: 1280px; margin: 0 auto; padding: 1.5rem; }}
+    section {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem 1.5rem; margin-bottom: 1.5rem; }}
+    h2 {{ font-size: 1.1rem; margin-bottom: 0.8rem; padding-bottom: 0.4rem; border-bottom: 2px solid var(--border); }}
+    h3 {{ font-size: 0.95rem; margin: 0.7rem 0 0.4rem; }}
+    /* 模式卡片网格 */
+    .pattern-cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px,1fr)); gap: 0.8rem; }}
+    .pat-card {{ border: 1px solid var(--border); border-radius: 6px; overflow: hidden; cursor: pointer; transition: box-shadow .2s; }}
+    .pat-card:hover {{ box-shadow: 0 4px 12px rgba(0,0,0,.12); }}
+    .pat-card-header {{ color: white; padding: 0.4rem 0.7rem; display: flex; justify-content: space-between; align-items: center; }}
+    .pat-id {{ font-weight: 700; font-size: 0.78rem; }}
+    .new-badge {{ background: rgba(255,255,255,.25); padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.68rem; }}
+    .pat-card-body {{ padding: 0.5rem 0.7rem; }}
+    .pat-name {{ font-size: 0.8rem; font-weight: 600; }}
+    .pat-count {{ font-size: 0.75rem; color: var(--muted); }}
+    .pat-high {{ font-size: 0.72rem; color: {SEVERITY_COLORS["HIGH"]}; margin-top: 0.2rem; }}
+    /* 模式详情 */
+    .pattern-section {{ padding: 0; overflow: hidden; }}
+    .pattern-header {{ padding: 0.8rem 1.2rem; background: #fafafa; border-bottom: 1px solid var(--border); }}
+    .pattern-title-row {{ display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; }}
+    .pattern-id-badge {{ color: white; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.8rem; font-weight: 700; }}
+    .pattern-name {{ font-size: 1.05rem; font-weight: 600; }}
+    .new-tag {{ background: {NEW_COLOR}; color: white; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.72rem; margin-left: 0.5rem; }}
+    .pattern-count {{ color: var(--muted); font-size: 0.85rem; margin-left: auto; }}
+    .pattern-body {{ padding: 1rem 1.2rem; }}
+    /* 分析网格 */
+    .analysis-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }}
+    @media (max-width: 768px) {{ .analysis-grid {{ grid-template-columns: 1fr; }} }}
+    .analysis-card {{ background: #fafafa; border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem; }}
+    .card-title {{ font-size: 0.88rem; font-weight: 700; margin-bottom: 0.5rem; }}
+    .vuln-title {{ color: {SEVERITY_COLORS["HIGH"]}; }}
+    .defense-title {{ color: #1b5e20; }}
+    .feature-list {{ list-style: disc; padding-left: 1.2rem; font-size: 0.83rem; line-height: 1.8; }}
+    .defense-list li {{ color: #1b5e20; }}
+    /* Code diff */
+    .diff-block {{ margin: 0.8rem 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+    .diff-title {{ background: #eceff1; padding: 0.4rem 0.8rem; font-size: 0.8rem; font-weight: 600; color: #37474f; }}
+    .diff-grid {{ display: grid; grid-template-columns: 1fr 1fr; }}
+    @media (max-width: 900px) {{ .diff-grid {{ grid-template-columns: 1fr; }} }}
+    .diff-col {{ overflow: hidden; }}
+    .diff-col-header {{ padding: 0.3rem 0.8rem; font-size: 0.78rem; font-weight: 600; }}
+    .before-header {{ background: #ffebee; color: {SEVERITY_COLORS["CRITICAL"]}; border-right: 1px solid #ffcdd2; }}
+    .after-header  {{ background: #e8f5e9; color: #1b5e20; }}
+    .diff-code {{ background: #263238; color: #cfd8dc; padding: 0.8rem; font-size: 0.78rem; line-height: 1.6; overflow-x: auto; min-height: 60px; white-space: pre; }}
+    .before-code {{ border-right: 2px solid {SEVERITY_COLORS["CRITICAL"]}; }}
+    .after-code {{ border-left: 2px solid #1b5e20; }}
+    /* Vuln table */
+    .vuln-table-wrapper {{ margin-top: 0.8rem; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 0.5rem; }}
+    th {{ background: #eceff1; text-align: left; padding: 0.5rem 0.6rem; border: 1px solid var(--border); white-space: nowrap; }}
+    td {{ padding: 0.4rem 0.6rem; border: 1px solid var(--border); vertical-align: middle; }}
+    tr:hover {{ background: #f8f9fa; }}
+    td.desc {{ max-width: 260px; color: var(--muted); }}
+    td.num {{ text-align: center; }}
+    code {{ background: #e8eaf6; padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.8rem; }}
+    a {{ color: #1565c0; }}
+    .badge {{ display: inline-block; color: white; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.72rem; font-weight: 600; }}
+    .muted {{ color: var(--muted); font-size: 0.82rem; margin-top: 0.4rem; }}
+    /* 新模式信息框 */
+    .new-pattern-info {{ background: #f3e5f5; border: 1px solid #ce93d8; border-left: 4px solid {NEW_COLOR}; padding: 0.8rem 1rem; margin: 0.8rem 1.2rem; border-radius: 4px; font-size: 0.84rem; }}
+    .new-pattern-title {{ font-weight: 700; color: {NEW_COLOR}; margin-bottom: 0.4rem; }}
+    /* Stats */
+    .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 0.8rem; }}
+    .stat-card {{ background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem; text-align: center; }}
+    .stat-card .value {{ font-size: 1.6rem; font-weight: 700; }}
+    .stat-card .label {{ font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }}
+    .risk-pill {{ background: {risk_color}; color: white; padding: 0.2rem 0.8rem; border-radius: 4px; font-weight: 700; font-size: 1rem; }}
+    footer {{ text-align: center; color: var(--muted); font-size: 0.75rem; padding: 1.5rem; }}
+    """
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Go 安全日报 — {h(date_str)}</title>
-  <style>
-    :root {{
-      --font: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-      --bg: #f5f5f5;
-      --card: #ffffff;
-      --border: #e0e0e0;
-      --text: #212121;
-      --muted: #757575;
-      --code-bg: #f1f1f1;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.7; font-size: 14px; }}
-    header {{ background: #1a1a2e; color: white; padding: 1.5rem 2rem; border-bottom: 4px solid {risk_color}; }}
-    header h1 {{ font-size: 1.5rem; margin-bottom: 0.3rem; }}
-    header .meta {{ color: #b0bec5; font-size: 0.82rem; }}
-    nav {{ background: #16213e; padding: 0.4rem 2rem; display: flex; gap: 1.5rem; flex-wrap: wrap; }}
-    nav a {{ color: #90caf9; text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0; }}
-    nav a:hover {{ color: white; }}
-    main {{ max-width: 1280px; margin: 0 auto; padding: 1.5rem; }}
-    section {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem 1.5rem; margin-bottom: 1.5rem; }}
-    h2 {{ font-size: 1.15rem; margin-bottom: 0.8rem; padding-bottom: 0.4rem; border-bottom: 2px solid var(--border); }}
-    h3 {{ font-size: 1rem; margin: 0.8rem 0 0.5rem; color: #37474f; }}
-    .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.8rem; }}
-    .stat-card {{ background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem; text-align: center; }}
-    .stat-card .value {{ font-size: 1.8rem; font-weight: 700; }}
-    .stat-card .label {{ font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }}
-    .risk-pill {{ display: inline-block; background: {risk_color}; color: white; padding: 0.3rem 1rem; border-radius: 4px; font-weight: 700; }}
-    .badge {{ display: inline-block; color: white; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }}
-    .badge-cat {{ font-size: 0.68rem; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-    th {{ background: #eceff1; text-align: left; padding: 0.5rem 0.7rem; border: 1px solid var(--border); font-weight: 600; white-space: nowrap; }}
-    td {{ padding: 0.4rem 0.7rem; border: 1px solid var(--border); vertical-align: middle; }}
-    tr.desc-row {{ display: none; }}
-    tr.desc-row.open {{ display: table-row; }}
-    tr.desc-row td {{ background: #f9fbe7; color: #555; font-size: 0.82rem; padding: 0.5rem 1rem; border-top: none; }}
-    tr.sev-critical td {{ border-left: 3px solid {SEVERITY_COLORS["CRITICAL"]}; }}
-    tr.sev-high td {{ border-left: 3px solid {SEVERITY_COLORS["HIGH"]}; }}
-    tr.sev-medium td {{ border-left: 3px solid {SEVERITY_COLORS["MEDIUM"]}; }}
-    tr.sev-low td {{ border-left: 3px solid {SEVERITY_COLORS["LOW"]}; }}
-    td.desc {{ max-width: 280px; color: var(--muted); }}
-    td.num {{ text-align: center; }}
-    code {{ background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.82rem; }}
-    a {{ color: #1565c0; }}
-    .bar-row {{ display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; }}
-    .bar-label {{ width: 90px; font-size: 0.78rem; font-weight: 600; color: #37474f; }}
-    .bar-track {{ flex: 1; background: #eceff1; border-radius: 4px; height: 16px; overflow: hidden; }}
-    .bar-fill {{ height: 100%; border-radius: 4px; }}
-    .bar-count {{ width: 30px; text-align: right; font-size: 0.78rem; font-weight: 700; }}
-    .bar-desc {{ font-size: 0.75rem; color: var(--muted); min-width: 120px; }}
-    .defense-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }}
-    .defense-card {{ border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
-    .defense-header {{ color: white; padding: 0.5rem 0.8rem; font-size: 0.85rem; }}
-    .defense-list {{ padding: 0.7rem 1rem; list-style: disc; font-size: 0.82rem; line-height: 1.8; }}
-    .checklist {{ list-style: none; padding: 0; }}
-    .checklist li {{ padding: 0.3rem 0; font-size: 0.85rem; border-bottom: 1px solid var(--border); }}
-    .checklist li::before {{ content: "☐ "; color: #90a4ae; }}
-    .toggle-btn {{ cursor: pointer; font-size: 0.75rem; color: #1565c0; }}
-    footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; padding: 1.5rem; }}
-    @media (max-width: 768px) {{ main {{ padding: 0.8rem; }} table {{ font-size: 0.78rem; }} }}
-  </style>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Go 安全分析报告 — {_h(date_str)}</title>
+  <style>{css}</style>
 </head>
 <body>
 <header>
-  <h1>🔐 Go 开源项目安全日报</h1>
+  <h1>🔐 Go 开源项目安全分析报告</h1>
   <div class="meta">
-    日期: <strong>{h(date_str)}</strong> &nbsp;|&nbsp;
-    生成时间: <strong>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</strong> &nbsp;|&nbsp;
-    数据来源: Go 官方漏洞库 / OSV.dev / GitHub Advisory / NVD
+    日期: <strong>{_h(date_str)}</strong> &nbsp;|&nbsp;
+    生成: <strong>{_h(ts)} UTC</strong> &nbsp;|&nbsp;
+    分析维度: 漏洞模式特征 · 代码修改对比 · 防御方案
+    {"&nbsp;|&nbsp;<strong style='color:#ce93d8'>🆕 " + str(len(new_patterns)) + " 个新模式</strong>" if new_patterns else ""}
   </div>
 </header>
 <nav>
   <a href="#summary">执行摘要</a>
-  <a href="#critical-high">高危漏洞</a>
-  <a href="#all-vulns">全部漏洞</a>
-  <a href="#patterns">漏洞特征</a>
-  <a href="#defense">防御建议</a>
+  {nav_links}
+  {"<a href='#new-patterns'>🆕 新模式</a>" if new_patterns else ""}
   <a href="#upgrade">升级清单</a>
 </nav>
 <main>
@@ -542,188 +931,46 @@ def generate_html(data: dict, date_str: str) -> str:
     <h2>执行摘要</h2>
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="value"><span class="risk-pill">{h(overall_risk)}</span></div>
-        <div class="label">整体风险等级</div>
+        <div class="value"><span class="risk-pill">{_h(overall)}</span></div>
+        <div class="label">整体风险</div>
       </div>
       <div class="stat-card">
-        <div class="value">{total}</div>
-        <div class="label">新增漏洞总数</div>
+        <div class="value">{total}</div><div class="label">漏洞总数</div>
       </div>
       <div class="stat-card">
-        <div class="value" style="color:{SEVERITY_COLORS['CRITICAL']}">{sev_counts.get('CRITICAL', 0)}</div>
+        <div class="value" style="color:{SEVERITY_COLORS['CRITICAL']}">{sev_counts.get('CRITICAL',0)}</div>
         <div class="label">🔴 CRITICAL</div>
       </div>
       <div class="stat-card">
-        <div class="value" style="color:{SEVERITY_COLORS['HIGH']}">{sev_counts.get('HIGH', 0)}</div>
+        <div class="value" style="color:{SEVERITY_COLORS['HIGH']}">{sev_counts.get('HIGH',0)}</div>
         <div class="label">🟠 HIGH</div>
       </div>
       <div class="stat-card">
-        <div class="value" style="color:{SEVERITY_COLORS['MEDIUM']}">{sev_counts.get('MEDIUM', 0)}</div>
+        <div class="value" style="color:{SEVERITY_COLORS['MEDIUM']}">{sev_counts.get('MEDIUM',0)}</div>
         <div class="label">🟡 MEDIUM</div>
       </div>
       <div class="stat-card">
-        <div class="value" style="color:{SEVERITY_COLORS['LOW']}">{sev_counts.get('LOW', 0)}</div>
-        <div class="label">🟢 LOW</div>
+        <div class="value" style="color:{NEW_COLOR}">{len(new_patterns)}</div>
+        <div class="label">🆕 新模式</div>
       </div>
     </div>
+
+    <h3 style="margin-top:1rem">漏洞模式分布</h3>
+    <div class="pattern-cards" style="margin-top:0.6rem">{pattern_cards}</div>
   </section>
 
-  <section id="patterns">
-    <h2>漏洞特征分析</h2>
-    <h3>本期漏洞类型分布</h3>
-    <div style="margin-top:0.5rem">{cat_bars or '<p style="color:var(--muted)">暂无分类数据</p>'}</div>
-  </section>
+  {pattern_sections}
 
-  <section id="all-vulns">
-    <h2>漏洞列表（{total} 条，点击行展开描述）</h2>
-    {"<p style='color:var(--muted)'>今日暂无新增漏洞</p>" if not advisories else f"""
-    <table>
-      <thead>
-        <tr>
-          <th>编号</th><th>受影响包</th><th>严重度</th><th>漏洞类型</th>
-          <th>修复版本</th><th>CVSS</th><th>摘要</th>
-        </tr>
-      </thead>
-      <tbody id="vuln-tbody">{vuln_rows}</tbody>
-    </table>"""}
-  </section>
+  {new_summary}
 
-  <section id="defense">
-    <h2>防御建议</h2>
-    <h3>本期高频漏洞类型加固方案</h3>
-    <div class="defense-cards" style="margin-top:0.8rem">{defense_cards or "<p style='color:var(--muted)'>暂无数据</p>"}</div>
-
-    <h3 style="margin-top:1.2rem">通用 Go 安全加固 Checklist</h3>
-    <ul class="checklist">
-      <li>运行 <code>govulncheck ./...</code> 检查已知漏洞依赖</li>
-      <li>CI 流水线启用 <code>go test -race ./...</code></li>
-      <li>审计所有 <code>unsafe</code> 包使用位置</li>
-      <li>所有 HTTP handler 设置超时和请求体大小限制</li>
-      <li>验证 TLS 配置（<code>MinVersion: tls.VersionTLS12</code>）</li>
-      <li>检查反序列化入口点（JSON/YAML/Protobuf）大小限制</li>
-      <li>审查文件操作中路径规范化逻辑</li>
-      <li>确认随机数生成使用 <code>crypto/rand</code></li>
-      <li>审计第三方包依赖，启用 <code>go.sum</code> 验证</li>
-    </ul>
-  </section>
-
-  <section id="upgrade">
-    <h2>依赖升级清单</h2>
-    <p style="color:var(--muted);font-size:0.85rem;margin-bottom:0.8rem">以下 CRITICAL/HIGH 漏洞已有修复版本，建议优先升级：</p>
-    {_build_upgrade_table(advisories, h)}
-  </section>
+  {upgrade_section}
 
 </main>
-<footer>
-  Go 开源项目安全日报 &nbsp;|&nbsp; 数据来源: vuln.go.dev / osv.dev / github.com/advisories / nvd.nist.gov
-  &nbsp;|&nbsp; {h(date_str)}
-</footer>
-<script>
-  // 点击行展开/收起描述
-  document.querySelectorAll('#vuln-tbody tr:not(.desc-row)').forEach(row => {{
-    row.style.cursor = 'pointer';
-    row.addEventListener('click', () => {{
-      const next = row.nextElementSibling;
-      if (next && next.classList.contains('desc-row')) {{
-        next.classList.toggle('open');
-      }}
-    }});
-  }});
-</script>
+<footer>Go 安全分析报告 · 漏洞模式驱动 · {_h(date_str)}</footer>
 </body>
 </html>"""
+
     return html
-
-
-def _build_upgrade_table(advisories: list[dict], h) -> str:
-    fixable = [v for v in advisories if _get_fix_version(v) and v.get("severity") in ("CRITICAL", "HIGH")]
-    if not fixable:
-        return "<p style='color:var(--muted)'>暂无需要升级的 CRITICAL/HIGH 漏洞。</p>"
-
-    rows = ""
-    seen = set()
-    for v in fixable[:30]:
-        pkg = _get_package_name(v)
-        if pkg in seen:
-            continue
-        seen.add(pkg)
-        fix = _get_fix_version(v)
-        vid = v.get("cve_id") or v.get("ghsa_id") or v.get("id") or "N/A"
-        sev = v.get("severity", "UNKNOWN")
-        vuln_range = _get_vuln_range(v)
-        color = SEVERITY_COLORS.get(sev, "#546e7a")
-        rows += f"""
-        <tr>
-          <td><code>{h(pkg)}</code></td>
-          <td><code>{h(vuln_range)}</code></td>
-          <td><strong>{h(fix)}</strong></td>
-          <td><span class="badge" style="background:{color}">{h(sev)}</span></td>
-          <td><code>{h(vid)}</code></td>
-        </tr>"""
-
-    return f"""<table>
-      <thead><tr><th>包名</th><th>受影响版本</th><th>修复版本</th><th>严重度</th><th>编号</th></tr></thead>
-      <tbody>{rows}</tbody>
-    </table>"""
-
-
-# ---------------------------------------------------------------------------
-# 辅助函数
-# ---------------------------------------------------------------------------
-
-def _get_package_name(v: dict) -> str:
-    affected = v.get("affected", [])
-    if affected:
-        first = affected[0]
-        pkg = first.get("package") or ""
-        if pkg:
-            return pkg
-    # GitHub advisory format
-    raw = v.get("_raw", {})
-    for vp in raw.get("vulnerabilities", []):
-        pkg = vp.get("package", {}).get("name", "")
-        if pkg:
-            return pkg
-    return v.get("id", "unknown")[:40]
-
-
-def _get_fix_version(v: dict) -> str:
-    affected = v.get("affected", [])
-    for a in affected:
-        fix_versions = a.get("fixed_versions", [])
-        for fv in fix_versions:
-            if isinstance(fv, dict) and fv.get("fixed"):
-                return fv["fixed"]
-        fixed_at = a.get("fixed_at")
-        if fixed_at:
-            return str(fixed_at)
-    return ""
-
-
-def _get_vuln_range(v: dict) -> str:
-    affected = v.get("affected", [])
-    for a in affected:
-        r = a.get("vulnerable_version_range", "")
-        if r:
-            return r
-        for fv in a.get("fixed_versions", []):
-            if isinstance(fv, dict) and fv.get("fixed"):
-                return f"< {fv['fixed']}"
-    return "见详情"
-
-
-def _get_pattern_summary(cat: str) -> str:
-    summaries = {
-        "G-DOS": "拒绝服务漏洞是本期 Go 项目中最常见的漏洞类型。主要原因包括：HTTP/2 流处理无限制、正则表达式回溯、内存分配无上限和 goroutine 泄漏。攻击者无需认证即可触发，影响服务可用性。",
-        "G-AUTH": "认证授权绕过漏洞通常由 JWT 算法混淆、RBAC 策略逻辑错误或中间件顺序问题引起。在 Kubernetes 等多租户系统中危害尤为严重。",
-        "G-INJ": "注入类漏洞在 Go 中主要体现在模板注入（text/template vs html/template）和命令执行（exec.Command with shell）场景。",
-        "G-PROTO": "序列化漏洞常见于 YAML 解析器（gopkg.in/yaml.v2 任意代码执行）、Protobuf 消息体积无限制和 JSON 解析器资源耗尽。",
-        "G-PATH": "路径遍历漏洞在容器运行时（如 runc, containerd）和文件服务器场景中高发，通常由 filepath.Join 未正确处理 '..' 序列引起。",
-        "G-CRYPTO": "密码学问题包括使用弱随机数（math/rand）、TLS 配置宽松（InsecureSkipVerify）和证书链验证绕过。",
-        "G-SSRF": "SSRF 漏洞在使用 http.Client 处理用户提供的 URL 时高发，容器和 Kubernetes 环境中可被用于访问云元数据服务。",
-        "G-RACE": "竞争条件漏洞通常在高并发场景下难以复现，Go 的 -race 标志可有效检测，但需要在测试中模拟并发场景。",
-    }
-    return summaries.get(cat, f"{VULN_CATEGORIES.get(cat, cat)} 类漏洞，请参考 references/go_vuln_patterns.md 获取详细分析。")
 
 
 # ---------------------------------------------------------------------------
@@ -731,67 +978,62 @@ def _get_pattern_summary(cat: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="生成 Go 安全日报")
-    parser.add_argument("--raw-file", required=True, help="fetch_advisories.py 输出的 JSON 文件路径")
-    parser.add_argument("--output-dir", default="./go-security-reports", help="输出目录")
-    parser.add_argument(
-        "--format",
-        choices=["html", "markdown", "both"],
-        default="both",
-        help="输出格式（默认 both）",
-    )
-    parser.add_argument("--date", help="报告日期（YYYY-MM-DD），默认从文件中读取")
+    parser = argparse.ArgumentParser(description="生成 Go 安全日报（漏洞模式驱动）")
+    parser.add_argument("--raw-file",   required=True, help="fetch_advisories.py 输出的 JSON 文件")
+    parser.add_argument("--output-dir", default="./go-security-reports")
+    parser.add_argument("--format",     choices=["html","markdown","both"], default="both")
+    parser.add_argument("--date",       help="报告日期 YYYY-MM-DD")
     args = parser.parse_args()
 
-    raw_file = Path(args.raw_file)
+    raw_file   = Path(args.raw_file)
     if not raw_file.exists():
-        print(f"ERROR: 找不到文件 {raw_file}", file=sys.stderr)
-        sys.exit(1)
+        print(f"ERROR: 找不到文件 {raw_file}", file=sys.stderr); sys.exit(1)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"加载数据: {raw_file}")
-    data = load_raw(str(raw_file))
+    data     = load_raw(str(raw_file))
+    date_str = args.date or data.get("date") or raw_file.parent.name \
+               or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # 从文件路径或参数推断日期
-    date_str = args.date or data.get("date") or raw_file.parent.name or \
-               datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    adv   = data.get("advisories", [])
+    sev   = data.get("severity_counts", {})
+    cats  = data.get("category_counts", {})
+    total = data.get("total", len(adv))
+    new_patterns = [c for c in cats if c.startswith("G-NEW-")]
 
-    total = data.get("total", len(data.get("advisories", [])))
-    sev = data.get("severity_counts", {})
     print(f"漏洞总数: {total}  CRITICAL={sev.get('CRITICAL',0)} HIGH={sev.get('HIGH',0)} "
           f"MEDIUM={sev.get('MEDIUM',0)} LOW={sev.get('LOW',0)}")
+    print(f"漏洞模式: {len(cats)} 类  新模式: {len(new_patterns)} 个")
 
     reports = []
-
     if args.format in ("html", "both"):
-        out_path = output_dir / f"go-security-digest-{date_str}.html"
-        print(f"生成 HTML 日报...")
-        html = generate_html(data, date_str)
-        out_path.write_text(html, encoding="utf-8")
-        reports.append(str(out_path))
-        print(f"  HTML: {out_path}")
+        p = output_dir / f"go-security-digest-{date_str}.html"
+        print("生成 HTML 日报（漏洞模式驱动）...")
+        p.write_text(generate_html(data, date_str), encoding="utf-8")
+        reports.append(str(p))
+        print(f"  HTML: {p}")
 
     if args.format in ("markdown", "both"):
-        out_path = output_dir / f"go-security-digest-{date_str}.md"
-        print(f"生成 Markdown 日报...")
-        md = generate_markdown(data, date_str)
-        out_path.write_text(md, encoding="utf-8")
-        reports.append(str(out_path))
-        print(f"  Markdown: {out_path}")
+        p = output_dir / f"go-security-digest-{date_str}.md"
+        print("生成 Markdown 日报（漏洞模式驱动）...")
+        p.write_text(generate_markdown(data, date_str), encoding="utf-8")
+        reports.append(str(p))
+        print(f"  Markdown: {p}")
 
-    overall_risk = "CRITICAL" if sev.get("CRITICAL", 0) > 0 else \
-                   "HIGH" if sev.get("HIGH", 0) > 0 else \
-                   "MEDIUM" if sev.get("MEDIUM", 0) > 0 else "LOW"
+    overall = ("CRITICAL" if sev.get("CRITICAL",0) > 0 else
+               "HIGH"     if sev.get("HIGH",0) > 0 else
+               "MEDIUM"   if sev.get("MEDIUM",0) > 0 else "LOW")
 
     print(f"\n{'='*60}")
-    print(f"Go 安全日报生成完成")
+    print(f"Go 安全分析报告生成完成")
     print(f"{'='*60}")
-    print(f"日期       : {date_str}")
-    print(f"整体风险   : {overall_risk}")
-    print(f"漏洞总数   : {total}")
-    print(f"报告文件   :")
+    print(f"日期     : {date_str}")
+    print(f"整体风险 : {overall}")
+    print(f"漏洞总数 : {total}")
+    if new_patterns:
+        print(f"🆕 新模式 : {', '.join(new_patterns)}")
+    print(f"报告文件 :")
     for r in reports:
         print(f"  {r}")
     print(f"{'='*60}\n")

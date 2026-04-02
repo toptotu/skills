@@ -1,0 +1,56 @@
+{
+  "skill_name": "go-security-audit-cn",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "请对这个 Go REST API 服务进行安全审计。以下是相关代码：\n\n```go\n// main.go\npackage main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/gin-gonic/gin\"\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc main() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\n\tr := gin.Default()\n\tr.GET(\"/users\", getUsers)\n\tr.POST(\"/exec\", runCommand)\n\tr.GET(\"/fetch\", fetchURL)\n\tr.Run(\":8080\")\n}\n\nfunc getUsers(c *gin.Context) {\n\tname := c.Query(\"name\")\n\trows, err := db.Query(fmt.Sprintf(\"SELECT id, name, email FROM users WHERE name = '%s'\", name))\n\tif err != nil {\n\t\tc.JSON(500, err.Error())\n\t\treturn\n\t}\n\tdefer rows.Close()\n\tvar users []map[string]interface{}\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar userName, email string\n\t\trows.Scan(&id, &userName, &email)\n\t\tusers = append(users, map[string]interface{}{\"id\": id, \"name\": userName, \"email\": email})\n\t}\n\tc.JSON(200, users)\n}\n\nfunc runCommand(c *gin.Context) {\n\tvar req struct {\n\t\tCmd string `json:\"cmd\"`\n\t}\n\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\tc.JSON(400, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\tout, err := exec.Command(\"sh\", \"-c\", req.Cmd).CombinedOutput()\n\tif err != nil {\n\t\tc.JSON(500, string(out))\n\t\treturn\n\t}\n\tc.JSON(200, gin.H{\"output\": string(out)})\n}\n\nfunc fetchURL(c *gin.Context) {\n\ttargetURL := c.Query(\"url\")\n\tresp, err := http.Get(targetURL)\n\tif err != nil {\n\t\tc.JSON(500, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\tbody, _ := io.ReadAll(resp.Body)\n\tc.Data(200, \"text/plain\", body)\n}\n```",
+      "expected_output": "一份结构化漏洞报告，涵盖：getUsers 中的 SQL 注入（fmt.Sprintf 拼接 SQL 查询）、runCommand 中的操作系统命令注入（exec.Command 使用 sh -c）、fetchURL 中的 SSRF（用户控制 URL）、错误消息信息泄漏（原始 err.Error() 返回给客户端）、所有路由缺少认证/鉴权。报告必须包含漏洞代码片段、调用链、带 HTTP 请求的 PoC、根因分析和修复建议。",
+      "files": [],
+      "assertions": [
+        "报告识别出 getUsers 处理函数中的 SQL 注入漏洞",
+        "报告识别出 runCommand 处理函数中的操作系统命令注入漏洞",
+        "报告识别出 fetchURL 处理函数中的 SSRF 漏洞",
+        "每个注入类发现包含至少一个 PoC HTTP 请求",
+        "每个发现包含从 HTTP 路由追踪到漏洞行的调用链",
+        "每个发现包含根因分析",
+        "每个发现包含附有 Go 代码示例的修复建议",
+        "报告包含按严重程度统计发现总数的执行摘要",
+        "报告识别出路由缺少认证/鉴权问题"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "请帮我审计这个 Go 微服务的安全问题。这是一个使用 JWT 认证的用户管理服务：\n\n```go\n// handlers/user.go\npackage handlers\n\nimport (\n\t\"crypto/md5\"\n\t\"fmt\"\n\t\"io\"\n\t\"math/rand\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"time\"\n\n\t\"github.com/dgrijalva/jwt-go\"\n)\n\nvar jwtSecret = \"secret\"\n\nfunc Login(w http.ResponseWriter, r *http.Request) {\n\tusername := r.FormValue(\"username\")\n\tpassword := r.FormValue(\"password\")\n\thash := fmt.Sprintf(\"%x\", md5.Sum([]byte(password)))\n\t// 与数据库中的哈希值比较...\n\t_ = hash\n\ttoken := jwt.New(jwt.SigningMethodHS256)\n\ttokenString, _ := token.SignedString([]byte(jwtSecret))\n\tw.Write([]byte(tokenString))\n}\n\nfunc ParseToken(tokenString string) (*jwt.Token, error) {\n\treturn jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {\n\t\treturn []byte(jwtSecret), nil\n\t})\n}\n\nfunc DownloadFile(w http.ResponseWriter, r *http.Request) {\n\tfilename := r.URL.Query().Get(\"file\")\n\tbasePath := \"/var/app/uploads\"\n\tfullPath := filepath.Join(basePath, filename)\n\tf, err := os.Open(fullPath)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 500)\n\t\treturn\n\t}\n\tdefer f.Close()\n\tio.Copy(w, f)\n}\n\nfunc GenerateResetToken() string {\n\trand.Seed(time.Now().UnixNano())\n\tb := make([]byte, 16)\n\tfor i := range b {\n\t\tb[i] = byte(rand.Intn(256))\n\t}\n\treturn fmt.Sprintf(\"%x\", b)\n}\n```",
+      "expected_output": "一份结构化漏洞报告，涵盖：弱 JWT 密钥（硬编码的 'secret'）、JWT 算法混淆（ParseToken 未验证签名算法）、使用 MD5 进行密码哈希（弱算法，无盐值）、DownloadFile 中的路径穿越（filepath.Join 不阻止向上级目录穿越）、使用 math/rand 生成安全敏感的重置令牌（非密码学安全）、DownloadFile 中向客户端返回原始错误。每个发现必须包含严重程度、代码片段、调用链、根因、PoC 和修复建议。",
+      "files": [],
+      "assertions": [
+        "报告识别出硬编码的 JWT 密钥并将其评级为高危或严重",
+        "报告识别出 ParseToken 中的 JWT 算法混淆漏洞",
+        "报告识别出 MD5 是弱密码哈希算法",
+        "报告识别出 DownloadFile 中的路径穿越漏洞",
+        "报告识别出 math/rand 对令牌生成不具备密码学安全性",
+        "路径穿越发现包含展示如何读取 /etc/passwd 或类似文件的 PoC",
+        "JWT 发现包含展示如何验证签名算法的修复建议",
+        "MD5 发现推荐使用 bcrypt 或 argon2 作为替代",
+        "报告包含执行摘要"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "我有一个处理文件上传和处理的 Go 服务，请检查它是否存在安全漏洞：\n\n```go\n// main.go\npackage main\n\nimport (\n\t\"archive/zip\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"sync\"\n)\n\nvar counter int\nvar mu sync.Mutex\nvar cache = make(map[string][]byte)\n\nfunc uploadHandler(w http.ResponseWriter, r *http.Request) {\n\t// 请求体无大小限制\n\tvar payload map[string]interface{}\n\tif err := json.NewDecoder(r.Body).Decode(&payload); err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\n\tmu.Lock()\n\tcounter++\n\tmu.Unlock()\n\n\t// 无限制地生成 goroutine 进行处理\n\tgo processPayload(payload)\n\tw.WriteHeader(202)\n}\n\nfunc processPayload(payload map[string]interface{}) {\n\tdata, _ := json.Marshal(payload)\n\tcacheKey := fmt.Sprintf(\"%v\", payload[\"id\"])\n\tcache[cacheKey] = data // 对 map 的非同步写操作\n}\n\nfunc extractZip(w http.ResponseWriter, r *http.Request) {\n\tfile, _, err := r.FormFile(\"file\")\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\ttmpFile, _ := os.CreateTemp(\"\", \"upload*.zip\")\n\tio.Copy(tmpFile, file)\n\ttmpFile.Close()\n\n\tzr, _ := zip.OpenReader(tmpFile.Name())\n\tdefer zr.Close()\n\n\tfor _, f := range zr.File {\n\t\t// Zip Slip 漏洞\n\t\tdestPath := filepath.Join(\"/var/app/extracted\", f.Name)\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(destPath, 0755)\n\t\t\tcontinue\n\t\t}\n\t\tdestFile, _ := os.Create(destPath)\n\t\trc, _ := f.Open()\n\t\tio.Copy(destFile, rc)\n\t\trc.Close()\n\t\tdestFile.Close()\n\t}\n\tw.WriteHeader(200)\n}\n\nfunc templateHandler(w http.ResponseWriter, r *http.Request) {\n\ttmplStr := r.URL.Query().Get(\"template\")\n\tt, err := template.New(\"user\").Parse(tmplStr)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\tt.Execute(w, map[string]string{\"user\": r.URL.Query().Get(\"user\")})\n}\n```",
+      "expected_output": "一份结构化漏洞报告，涵盖：extractZip 中的 Zip Slip 路径穿越（包含 ../ 的 zip 条目写入任意路径）、templateHandler 中的服务端模板注入（用户控制的模板字符串）、uploadHandler 中无界 JSON body 读取（通过大载荷实施 DoS，缺少 http.MaxBytesReader）、processPayload 中并发非同步 map 写操作（cache map 上的数据竞态）、uploadHandler 中无界 goroutine 生成（goroutine 泄漏/DoS）。报告必须包含完整结构（含 PoC）。",
+      "files": [],
+      "assertions": [
+        "报告识别出 extractZip 处理函数中的 Zip Slip 漏洞",
+        "报告识别出 templateHandler 中的服务端模板注入",
+        "报告识别出缺少请求体大小限制（http.MaxBytesReader）",
+        "报告识别出并发非同步 map 写操作为数据竞态",
+        "Zip Slip 发现包含展示使用含 ../ 文件名的精心构造 zip 条目的 PoC",
+        "模板注入发现包含展示恶意模板字符串的 PoC",
+        "数据竞态发现解释了为何并发写入 Go map 是不安全的",
+        "报告包含列出所有问题的发现汇总表",
+        "修复建议包含正确的 Go 代码模式（filepath.Clean 检查、html/template 安全说明、http.MaxBytesReader、sync.RWMutex）"
+      ]
+    }
+  ]
+}

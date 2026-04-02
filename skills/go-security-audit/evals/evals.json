@@ -1,0 +1,56 @@
+{
+  "skill_name": "go-security-audit",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Please do a security audit of this Go REST API service. Here's the relevant code:\n\n```go\n// main.go\npackage main\n\nimport (\n\t\"database/sql\"\n\t\"fmt\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/gin-gonic/gin\"\n\t_ \"github.com/lib/pq\"\n)\n\nvar db *sql.DB\n\nfunc main() {\n\tvar err error\n\tdb, err = sql.Open(\"postgres\", os.Getenv(\"DATABASE_URL\"))\n\tif err != nil {\n\t\tlog.Fatal(err)\n\t}\n\n\tr := gin.Default()\n\tr.GET(\"/users\", getUsers)\n\tr.POST(\"/exec\", runCommand)\n\tr.GET(\"/fetch\", fetchURL)\n\tr.Run(\":8080\")\n}\n\nfunc getUsers(c *gin.Context) {\n\tname := c.Query(\"name\")\n\trows, err := db.Query(fmt.Sprintf(\"SELECT id, name, email FROM users WHERE name = '%s'\", name))\n\tif err != nil {\n\t\tc.JSON(500, err.Error())\n\t\treturn\n\t}\n\tdefer rows.Close()\n\tvar users []map[string]interface{}\n\tfor rows.Next() {\n\t\tvar id int\n\t\tvar userName, email string\n\t\trows.Scan(&id, &userName, &email)\n\t\tusers = append(users, map[string]interface{}{\"id\": id, \"name\": userName, \"email\": email})\n\t}\n\tc.JSON(200, users)\n}\n\nfunc runCommand(c *gin.Context) {\n\tvar req struct {\n\t\tCmd string `json:\"cmd\"`\n\t}\n\tif err := c.ShouldBindJSON(&req); err != nil {\n\t\tc.JSON(400, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\tout, err := exec.Command(\"sh\", \"-c\", req.Cmd).CombinedOutput()\n\tif err != nil {\n\t\tc.JSON(500, string(out))\n\t\treturn\n\t}\n\tc.JSON(200, gin.H{\"output\": string(out)})\n}\n\nfunc fetchURL(c *gin.Context) {\n\ttargetURL := c.Query(\"url\")\n\tresp, err := http.Get(targetURL)\n\tif err != nil {\n\t\tc.JSON(500, gin.H{\"error\": err.Error()})\n\t\treturn\n\t}\n\tdefer resp.Body.Close()\n\tbody, _ := io.ReadAll(resp.Body)\n\tc.Data(200, \"text/plain\", body)\n}\n```",
+      "expected_output": "A structured vulnerability report covering: SQL injection in getUsers (fmt.Sprintf into SQL query), OS command injection in runCommand (exec.Command with sh -c), SSRF in fetchURL (user-controlled URL), error message information leakage (raw err.Error() returned to client), and no authentication/authorization on any routes. Report must include vulnerable code snippets, call chains, PoCs with HTTP requests, root causes, and remediations.",
+      "files": [],
+      "assertions": [
+        "The report identifies the SQL injection vulnerability in the getUsers handler",
+        "The report identifies the OS command injection vulnerability in the runCommand handler",
+        "The report identifies the SSRF vulnerability in the fetchURL handler",
+        "The report includes at least one PoC HTTP request per injection finding",
+        "Each finding includes a call chain tracing from the HTTP route to the vulnerable line",
+        "Each finding includes a root cause explanation",
+        "Each finding includes a remediation with a Go code example",
+        "The report includes an executive summary with total findings by severity",
+        "The report identifies the missing authentication/authorization on routes"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Audit my Go microservice for security issues. It's a JWT-authenticated user management service:\n\n```go\n// handlers/user.go\npackage handlers\n\nimport (\n\t\"crypto/md5\"\n\t\"fmt\"\n\t\"io\"\n\t\"math/rand\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"time\"\n\n\t\"github.com/dgrijalva/jwt-go\"\n)\n\nvar jwtSecret = \"secret\"\n\nfunc Login(w http.ResponseWriter, r *http.Request) {\n\tusername := r.FormValue(\"username\")\n\tpassword := r.FormValue(\"password\")\n\thash := fmt.Sprintf(\"%x\", md5.Sum([]byte(password)))\n\t// check hash against DB...\n\t_ = hash\n\ttoken := jwt.New(jwt.SigningMethodHS256)\n\ttokenString, _ := token.SignedString([]byte(jwtSecret))\n\tw.Write([]byte(tokenString))\n}\n\nfunc ParseToken(tokenString string) (*jwt.Token, error) {\n\treturn jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {\n\t\treturn []byte(jwtSecret), nil\n\t})\n}\n\nfunc DownloadFile(w http.ResponseWriter, r *http.Request) {\n\tfilename := r.URL.Query().Get(\"file\")\n\tbasePath := \"/var/app/uploads\"\n\tfullPath := filepath.Join(basePath, filename)\n\tf, err := os.Open(fullPath)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 500)\n\t\treturn\n\t}\n\tdefer f.Close()\n\tio.Copy(w, f)\n}\n\nfunc GenerateResetToken() string {\n\trand.Seed(time.Now().UnixNano())\n\tb := make([]byte, 16)\n\tfor i := range b {\n\t\tb[i] = byte(rand.Intn(256))\n\t}\n\treturn fmt.Sprintf(\"%x\", b)\n}\n```",
+      "expected_output": "A structured vulnerability report covering: weak JWT secret (hardcoded 'secret'), JWT algorithm confusion (ParseToken does not verify signing method), MD5 used for password hashing (weak, no salt), path traversal in DownloadFile (filepath.Join does not prevent traversal to parent directories), math/rand used for security-sensitive reset token generation (not cryptographically secure), raw error returned to client in DownloadFile. Each finding must have severity, code snippet, call chain, root cause, PoC, and remediation.",
+      "files": [],
+      "assertions": [
+        "The report identifies the hardcoded JWT secret and rates it High or Critical",
+        "The report identifies the JWT algorithm confusion vulnerability in ParseToken",
+        "The report identifies MD5 as a weak password hashing algorithm",
+        "The report identifies the path traversal vulnerability in DownloadFile",
+        "The report identifies math/rand as cryptographically insecure for token generation",
+        "The path traversal finding includes a PoC showing how to read /etc/passwd or similar",
+        "The JWT finding includes a remediation showing how to verify the signing method",
+        "The MD5 finding recommends bcrypt or argon2 as a replacement",
+        "The report has an executive summary"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I have a Go service that handles file uploads and processes them. Can you check it for security vulnerabilities?\n\n```go\n// main.go\npackage main\n\nimport (\n\t\"archive/zip\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"os\"\n\t\"path/filepath\"\n\t\"sync\"\n)\n\nvar counter int\nvar mu sync.Mutex\nvar cache = make(map[string][]byte)\n\nfunc uploadHandler(w http.ResponseWriter, r *http.Request) {\n\t// No size limit on body\n\tvar payload map[string]interface{}\n\tif err := json.NewDecoder(r.Body).Decode(&payload); err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\n\tmu.Lock()\n\tcounter++\n\tmu.Unlock()\n\n\t// spawn goroutine for processing, no limit\n\tgo processPayload(payload)\n\tw.WriteHeader(202)\n}\n\nfunc processPayload(payload map[string]interface{}) {\n\tdata, _ := json.Marshal(payload)\n\tcacheKey := fmt.Sprintf(\"%v\", payload[\"id\"])\n\tcache[cacheKey] = data // unsynchronized write to map\n}\n\nfunc extractZip(w http.ResponseWriter, r *http.Request) {\n\tfile, _, err := r.FormFile(\"file\")\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\tdefer file.Close()\n\n\ttmpFile, _ := os.CreateTemp(\"\", \"upload*.zip\")\n\tio.Copy(tmpFile, file)\n\ttmpFile.Close()\n\n\tzr, _ := zip.OpenReader(tmpFile.Name())\n\tdefer zr.Close()\n\n\tfor _, f := range zr.File {\n\t\t// Zip Slip vulnerability\n\t\tdestPath := filepath.Join(\"/var/app/extracted\", f.Name)\n\t\tif f.FileInfo().IsDir() {\n\t\t\tos.MkdirAll(destPath, 0755)\n\t\t\tcontinue\n\t\t}\n\t\tdestFile, _ := os.Create(destPath)\n\t\trc, _ := f.Open()\n\t\tio.Copy(destFile, rc)\n\t\trc.Close()\n\t\tdestFile.Close()\n\t}\n\tw.WriteHeader(200)\n}\n\nfunc templateHandler(w http.ResponseWriter, r *http.Request) {\n\ttmplStr := r.URL.Query().Get(\"template\")\n\tt, err := template.New(\"user\").Parse(tmplStr)\n\tif err != nil {\n\t\thttp.Error(w, err.Error(), 400)\n\t\treturn\n\t}\n\tt.Execute(w, map[string]string{\"user\": r.URL.Query().Get(\"user\")})\n}\n```",
+      "expected_output": "A structured vulnerability report covering: Zip Slip path traversal in extractZip (zip entries with ../ in names written to arbitrary paths), server-side template injection in templateHandler (user-controlled template string), unbounded JSON body read in uploadHandler (DoS via large payload, missing http.MaxBytesReader), concurrent unsynchronized map write in processPayload (data race on cache map), unbounded goroutine spawning in uploadHandler (goroutine leak/DoS). Report must have full structure including PoCs.",
+      "files": [],
+      "assertions": [
+        "The report identifies the Zip Slip vulnerability in the extractZip handler",
+        "The report identifies server-side template injection in the templateHandler",
+        "The report identifies the missing request body size limit (http.MaxBytesReader)",
+        "The report identifies the concurrent unsynchronized map write as a data race",
+        "The Zip Slip finding includes a PoC showing a crafted zip entry with ../ in the filename",
+        "The template injection finding includes a PoC showing a malicious template string",
+        "The data race finding explains why writing to a Go map concurrently is unsafe",
+        "The report has a finding summary table with all issues",
+        "Remediations include correct Go code patterns (filepath.Clean check, html/template safety note, http.MaxBytesReader, sync.RWMutex)"
+      ]
+    }
+  ]
+}

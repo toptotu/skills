@@ -43,11 +43,12 @@
     },
     {
       "name": "security-skills",
-      "description": "Security-focused skills for auditing and reviewing code. Includes Go security audit for finding vulnerabilities in Golang projects.",
+      "description": "Security-focused skills for auditing and reviewing code. Includes Go security audit for finding vulnerabilities in Golang projects (English and Chinese versions).",
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/go-security-audit"
+        "./skills/go-security-audit",
+        "./skills/go-security-audit-cn"
       ]
     }
     ,

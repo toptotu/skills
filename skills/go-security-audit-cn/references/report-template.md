@@ -159,17 +159,30 @@ Authorization: Bearer <有效令牌>
 | [包路径] | [vX.Y.Z] | [如 HTTP 路由器] | [如 无已知 CVE] |
 | [包路径] | [vX.Y.Z] | [如 JWT 库] | [如 若为 dgrijalva/jwt-go 则存在 CVE-2020-26160] |
 
-### B. 未审计文件
+### B. 辅助工具运行情况
+
+| 工具 | 状态 | 备注 |
+|---|---|---|
+| `govulncheck` | ✅ 已运行 / ⏭️ 未运行（离线环境） | [版本 / 跳过原因] |
+| `gosec` | ✅ 已运行 / ⏭️ 未运行（离线环境） | [版本 / 跳过原因] |
+| `staticcheck` | ✅ 已运行 / ⏭️ 未运行（离线环境） | [版本 / 跳过原因] |
+| `go test -race` | ✅ 已运行 / ⏭️ 未运行 | [结果摘要 / 跳过原因] |
+
+若有工具未运行，建议在具备网络条件时按照以下方式补充执行：
+- 参考 `references/offline-setup.md` 安装工具（含离线方案）
+- 工具均可用后运行：`govulncheck ./...`、`gosec ./...`、`staticcheck ./...`、`go test -race ./...`
+
+### C. 未审计文件
 
 [列出审计范围外的文件/包及原因，例如："vendor/ 目录"、"protobuf 生成文件"。]
 
-### C. 测试建议
+### D. 动态测试建议
 
 [建议用于验证发现的动态测试，例如：]
-- 运行 `go test -race ./...` 以暴露数据竞态。
-- 使用 `govulncheck ./...` 扫描依赖中的已知 CVE。
-- 运行 SAST 工具：`gosec ./...`、`staticcheck ./...`。
+- 对注入类发现：使用报告中的 PoC 载荷实际复现。
 - 对 SSRF 发现：使用内网 HTTP 监听器进行测试（如 Burp Collaborator 或 interactsh）。
+- 对竞态条件：在压力测试下运行 `go test -race ./...`。
+- 对认证发现：通过 Burp Suite 或 curl 重放修改后的 JWT 令牌。
 ```
 
 ---

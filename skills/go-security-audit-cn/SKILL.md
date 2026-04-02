@@ -9,6 +9,60 @@ description: 对 Golang 项目进行全面的代码安全审计。当用户想�
 
 ---
 
+## 环境说明与工具准备
+
+> **在开始审计前，先完成本节的环境检查。** 技能的核心审计（手动代码阅读与分析）在任何环境中均可运行，无需网络连接。辅助扫描工具可选，若不可用会自动跳过。
+
+本技能可调用三个辅助静态分析工具，作为手动审计的补充：
+
+| 工具 | 用途 | 是否必须 |
+|---|---|---|
+| `govulncheck` | 扫描 go.mod 依赖中的已知 CVE | 可选 |
+| `gosec` | Go 代码 SAST，自动检测常见安全模式 | 可选 |
+| `staticcheck` | Go 静态分析，含安全相关检查 | 可选 |
+
+### 环境检测
+
+在开始审计前，运行以下命令检测工具可用性：
+
+```bash
+command -v govulncheck && govulncheck --version || echo "[未安装] govulncheck"
+command -v gosec       && gosec --version       || echo "[未安装] gosec"
+command -v staticcheck && staticcheck --version  || echo "[未安装] staticcheck"
+```
+
+### 有网络访问时：一键安装
+
+```bash
+bash skills/go-security-audit-cn/scripts/install_tools.sh
+```
+
+### 离线环境：预先准备工具
+
+若目标机器无法访问公网，在**有网的机器**上预先编译，然后传输二进制文件到目标机器：
+
+```bash
+# 在联网机器上编译（需与目标机器同架构、同 OS）
+GOBIN=/tmp/audit-tools go install golang.org/x/vuln/cmd/govulncheck@latest
+GOBIN=/tmp/audit-tools go install github.com/securego/gosec/v2/cmd/gosec@latest
+GOBIN=/tmp/audit-tools go install honnef.co/go/tools/cmd/staticcheck@latest
+
+# 打包传输
+tar -czf audit-tools.tar.gz -C /tmp audit-tools
+
+# 在目标机器上安装
+tar -xzf audit-tools.tar.gz
+sudo cp audit-tools/* /usr/local/bin/ && chmod +x /usr/local/bin/govulncheck /usr/local/bin/gosec /usr/local/bin/staticcheck
+```
+
+> 详细的离线安装方案（含 Docker 镜像、内网 GOPROXY 代理、govulncheck 本地漏洞数据库配置）参见 `references/offline-setup.md`。
+
+### 工具不可用时的行为
+
+若工具均无法安装，**技能仍会完整运行**——所有四个阶段照常执行，依靠手动代码阅读与模式匹配完成审计。报告末尾会注明哪些辅助工具未运行，建议在有条件时补充执行。
+
+---
+
 ## 第一阶段 — 项目侦察
 
 在查找漏洞之前，先全面理解被审计的项目。
@@ -23,6 +77,10 @@ description: 对 Golang 项目进行全面的代码安全审计。当用户想�
   - 外部 HTTP 客户端（resty、fasthttp 等）
   - 配置 / 密钥加载器（viper、envconfig、godotenv 等）
 - 记录已知存在 CVE 的依赖（按包名和主版本号对照 GHSA / NVD 命名规范）
+- 若 `govulncheck` 可用，运行它作为依赖漏洞扫描的第一步：
+  ```bash
+  govulncheck ./...
+  ```
 
 ### 1.2 项目结构分析
 
@@ -76,9 +134,26 @@ description: 对 Golang 项目进行全面的代码安全审计。当用户想�
 
 系统性地审计代码。针对第二阶段识别出的每个高风险模块和入口点，追踪从输入到敏感操作的数据流。
 
-### 审计内容
+### 辅助工具扫描（若可用）
 
-逐一检查 `references/go-security-rules.md` 中列出的每个漏洞类别，对每个类别，搜索其中描述的具体 Go 代码模式。
+若工具已安装，在手动审计前先运行，收集初步结果作为参考线索：
+
+```bash
+# SAST 扫描（输出到文件便于引用）
+gosec -fmt=json -out=gosec-results.json ./... 2>/dev/null || gosec ./...
+
+# 静态分析
+staticcheck ./...
+
+# 竞态检测（需要能编译和运行测试）
+go test -race ./... 2>&1 | grep -E "DATA RACE|FAIL|ok"
+```
+
+扫描结果作为**辅助参考**，不能替代手动审计——SAST 工具有误报，也有漏报。对每个工具报告的问题，手动确认其是否真实可利用。
+
+### 手动代码审计
+
+逐一检查 `references/go-security-rules.md` 中列出的每个漏洞类别，对每个类别，搜索其中描述的具体 Go 代码模式。广泛使用代码搜索工具（Grep、Glob）——不要只是浏览。
 
 ### 追踪调用链
 
@@ -124,16 +199,18 @@ HTTP POST /api/v1/users
 - **执行摘要**（项目概述、按严重程度统计的发现总数、整体风险态势）
 - **发现汇总表**（所有发现集中展示，便于快速扫描）
 - **详细发现**（每个发现一节，含以上 7 个字段）
-- **附录**（完整技术栈清单）
+- **附录**（完整技术栈清单、辅助工具运行情况说明）
 
 ---
 
 ## 审计工作流
 
-1. **侦察** — 读取 go.mod，扫描目录结构，撰写侦察摘要。
-2. **攻击面梳理** — 列出所有入口点，标记高风险模块。
-3. **审计** — 使用 `references/go-security-rules.md` 中的规则逐一检查每个高风险模块。广泛使用代码搜索工具（Grep、Glob）——不要只是浏览。
-4. **报告** — 按照 `references/report-template.md` 中的结构撰写完整报告，保存为项目根目录下的 `安全审计报告.md`（或用户指定的位置）。
+1. **环境检测** — 检查三个辅助工具是否可用，若不可用且有网络则运行安装脚本，离线环境则跳过。
+2. **侦察** — 读取 go.mod，扫描目录结构，撰写侦察摘要。若 `govulncheck` 可用则运行。
+3. **攻击面梳理** — 列出所有入口点，标记高风险模块。
+4. **辅助扫描** — 若 `gosec` / `staticcheck` 可用则运行，收集结果作为参考。
+5. **手动审计** — 使用 `references/go-security-rules.md` 中的规则逐一检查每个高风险模块。
+6. **报告** — 按照 `references/report-template.md` 中的结构撰写完整报告，保存为项目根目录下的 `安全审计报告.md`。
 
 **大型代码库（>50 个 Go 文件）的优先级：** 入口点处理器 → 认证/鉴权中间件 → 数据库/查询层 → 文件操作 → 出站 HTTP → 配置/密钥加载。
 
@@ -145,3 +222,5 @@ HTTP POST /api/v1/users
 
 - `references/go-security-rules.md` — Go 专项漏洞模式完整检查表，含检测启发式规则和 Go 标准库陷阱。审计每个漏洞类别时读取。
 - `references/report-template.md` — 撰写输出报告时使用的精确 Markdown 模板。
+- `references/offline-setup.md` — 离线/内网环境下安装辅助工具的详细方案（含 Docker 镜像、内网代理、本地漏洞数据库）。
+- `scripts/install_tools.sh` — 一键安装辅助工具的脚本（有网络时使用）。

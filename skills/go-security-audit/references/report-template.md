@@ -159,17 +159,30 @@ Authorization: Bearer <valid_token>
 | [package/path] | [vX.Y.Z] | [e.g., HTTP router] | [e.g., No known CVEs] |
 | [package/path] | [vX.Y.Z] | [e.g., JWT library] | [e.g., CVE-2020-26160 if dgrijalva/jwt-go] |
 
-### B. Files Not Audited
+### B. Helper Tool Run Status
+
+| Tool | Status | Notes |
+|---|---|---|
+| `govulncheck` | ✅ Ran / ⏭️ Skipped (offline) | [version / reason skipped] |
+| `gosec` | ✅ Ran / ⏭️ Skipped (offline) | [version / reason skipped] |
+| `staticcheck` | ✅ Ran / ⏭️ Skipped (offline) | [version / reason skipped] |
+| `go test -race` | ✅ Ran / ⏭️ Skipped | [result summary / reason skipped] |
+
+If any tools were skipped, run them when the environment allows:
+- See `references/offline-setup.md` for installation options (including offline methods)
+- Once available: `govulncheck ./...`, `gosec ./...`, `staticcheck ./...`, `go test -race ./...`
+
+### C. Files Not Audited
 
 [List any files/packages excluded from scope and why, e.g., "vendor/ directory", "generated protobuf files".]
 
-### C. Testing Recommendations
+### D. Dynamic Testing Recommendations
 
 [Suggest dynamic testing to verify the findings, e.g.:]
-- Run `go test -race ./...` to surface data races.
-- Use `govulncheck ./...` to scan for known CVEs in dependencies.
-- Run SAST tools: `gosec ./...`, `staticcheck ./...`.
-- For SSRF findings: test with an internal HTTP listener (e.g., Burp Collaborator or interactsh).
+- For injection findings: reproduce using the PoC payloads in this report.
+- For SSRF findings: test with an out-of-band HTTP listener (e.g., Burp Collaborator or interactsh).
+- For race conditions: run `go test -race ./...` under load.
+- For auth findings: replay modified JWT tokens via Burp Suite or curl.
 ```
 
 ---

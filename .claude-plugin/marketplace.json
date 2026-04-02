@@ -40,6 +40,15 @@
         "./skills/web-artifacts-builder",
         "./skills/webapp-testing"
       ]
+    },
+    {
+      "name": "security-skills",
+      "description": "Security-focused skills for auditing and reviewing code. Includes Go security audit for finding vulnerabilities in Golang projects.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/go-security-audit"
+      ]
     }
     ,
     {
